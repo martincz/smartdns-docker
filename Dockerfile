@@ -6,7 +6,7 @@
 
  RUN apt update && \
      apt install -y git make gcc libssl-dev && \
-     git clone https://github.com/pymumu/smartdns.git --depth 1 && \
+     git clone https://github.com/martincz/smartdns.git --depth 1 && \
      cd smartdns && \
      sh ./package/build-pkg.sh --platform debian --arch `dpkg --print-architecture` && \
      dpkg -i package/*.deb && \

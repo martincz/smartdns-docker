@@ -42,13 +42,14 @@ build()
 	mkdir $ROOT/etc/smartdns/ -p
 	mkdir $ROOT/etc/default/ -p
 	mkdir $ROOT/lib/systemd/system/ -p
+	mkdir $ROOT/opt/smartdns/ -p
 
 	sed -i "s/Version:.*/Version: $VER/" $ROOT/DEBIAN/control
 	sed -i "s/Architecture:.*/Architecture: $ARCH/" $ROOT/DEBIAN/control
 	chmod 0755 $ROOT/DEBIAN/prerm
 
-	cp $SMARTDNS_DIR/etc/smartdns/smartdns.conf  $ROOT/etc/smartdns/
-	cp $SMARTDNS_DIR/etc/default/smartdns  $ROOT/etc/default/
+	cp $SMARTDNS_DIR/etc/smartdns/smartdns.conf $ROOT/opt/smartdns/
+	cp $SMARTDNS_DIR/etc/default/smartdns $ROOT/etc/default/
 	cp $SMARTDNS_DIR/systemd/smartdns.service $ROOT/lib/systemd/system/ 
 	cp $SMARTDNS_DIR/src/smartdns $ROOT/usr/sbin
 	if [ $? -ne 0 ]; then

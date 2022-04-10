@@ -1072,3 +1072,21 @@ void print_stack(void)
 		tlog(TLOG_FATAL, "#%.2d: %p %s from %s+%p", idx + 1, addr, symbol, info.dli_fname, offset);
 	}
 }
+
+bool file_exists(char *file_name) {
+	if (!fopen(file_name, "r")) {
+		return false;
+	}
+	return true;
+}
+
+void copy_file(char *source_file, char *target_file) {
+	int ch;
+	FILE *source = fopen(source_file, "r");
+	FILE *target = fopen(target_file, "w");
+	while ((ch = fgetc(source)) != EOF) {
+		fputc(ch, target);
+	}
+	fclose(source);
+	fclose(target);
+}

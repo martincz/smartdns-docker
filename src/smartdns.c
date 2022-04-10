@@ -42,6 +42,7 @@
 #include <ucontext.h>
 
 #define RESOLVE_FILE "/etc/resolv.conf"
+#define SAMPLE_CONF_FILE "/opt/smartdns/smartdns.conf"
 #define MAX_LINE_LEN 1024
 #define MAX_KEY_LEN 64
 #define SMARTDNS_PID_FILE "/var/run/smartdns.pid"
@@ -437,6 +438,10 @@ int main(int argc, char *argv[])
 
 	if (create_pid_file(pid_file) != 0) {
 		goto errout;
+	}
+
+	if (!file_exists(config_file)) {
+		copy_file(SAMPLE_CONF_FILE, config_file);
 	}
 
 	signal(SIGPIPE, SIG_IGN);
