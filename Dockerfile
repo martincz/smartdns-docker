@@ -1,5 +1,9 @@
  FROM debian:buster-slim
 
+ LABEL maintainer="Martincz Gao <martincz@mokeedev.com>"
+
+ ENV TZ=Asia/Shanghai
+
  RUN apt update && \
      apt install -y git make gcc libssl-dev && \
      git clone https://github.com/pymumu/smartdns.git --depth 1 && \
@@ -12,7 +16,8 @@
      apt clean && \
      rm -rf /var/lib/apt/lists/*
 
+ EXPOSE 53/tcp
  EXPOSE 53/udp
  VOLUME "/etc/smartdns/"
 
- CMD ["/usr/sbin/smartdns", "-f"]
+ CMD ["/usr/sbin/smartdns", "-f", "-x"]
