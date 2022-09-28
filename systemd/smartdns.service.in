@@ -9,10 +9,9 @@ Type=forking
 PIDFile=@RUNSTATEDIR@/smartdns.pid
 EnvironmentFile=@SYSCONFDIR@/default/smartdns
 ExecStart=@SBINDIR@/smartdns -p @RUNSTATEDIR@/smartdns.pid $SMART_DNS_OPTS 
-KillMode=process
 Restart=always
 RestartSec=2
-TimeoutStopSec=5
+TimeoutStopSec=15
 
 [Install]
 WantedBy=multi-user.target

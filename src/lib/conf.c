@@ -18,16 +18,46 @@
 
 #include "conf.h"
 #include <getopt.h>
+#include <libgen.h>
+#include <linux/limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
-static const char *currrent_conf_file = NULL;
+static const char *current_conf_file = NULL;
 
 const char *conf_get_conf_file(void)
 {
-	return currrent_conf_file;
+	return current_conf_file;
+}
+
+const char *conf_get_conf_fullpath(const char *path, char *fullpath, size_t path_len)
+{
+	char file_path_dir[PATH_MAX];
+
+	if (path_len < 1) {
+		return NULL;
+	}
+
+	if (path[0] == '/') {
+		strncpy(fullpath, path, path_len);
+		return fullpath;
+	}
+
+	strncpy(file_path_dir, conf_get_conf_file(), PATH_MAX - 1);
+	file_path_dir[PATH_MAX - 1] = 0;
+	dirname(file_path_dir);
+	if (file_path_dir[0] == '\0') {
+		strncpy(fullpath, path, path_len);
+		return fullpath;
+	}
+
+	if (snprintf(fullpath, PATH_MAX, "%s/%s", file_path_dir, path) < 0) {
+		return NULL;
+	}
+
+	return fullpath;
 }
 
 int conf_custom(const char *item, void *data, int argc, char *argv[])
@@ -97,7 +127,6 @@ int conf_yesno(const char *item, void *data, int argc, char *argv[])
 
 int conf_size(const char *item, void *data, int argc, char *argv[])
 {
-	/* read dns cache size */
 	int base = 1;
 	size_t size = 0;
 	int num = 0;
@@ -129,7 +158,32 @@ int conf_size(const char *item, void *data, int argc, char *argv[])
 	return 0;
 }
 
-void conf_getopt_reset(void)
+int conf_enum(const char *item, void *data, int argc, char *argv[])
+{
+	struct config_enum *item_enum = data;
+	char *enum_name = argv[1];
+	int i = 0;
+
+	if (argc <= 0) {
+		return -1;
+	}
+
+	for (i = 0; item_enum->list[i].name != NULL; i++) {
+		if (strcmp(enum_name, item_enum->list[i].name) == 0) {
+			*(item_enum->data) = item_enum->list[i].id;
+			return 0;
+		}
+	}
+
+	printf("Not found config value '%s', valid value is:\n", enum_name);
+	for (i = 0; item_enum->list[i].name != NULL; i++) {
+		printf(" %s\n", item_enum->list[i].name);
+	}
+
+	return -1;
+}
+
+static void conf_getopt_reset(void)
 {
 	static struct option long_options[] = {{"-", 0, 0, 0}, {0, 0, 0, 0}};
 	int argc = 2;
@@ -144,7 +198,7 @@ void conf_getopt_reset(void)
 	optopt = 0;
 }
 
-int conf_parse_args(char *key, char *value, int *argc, char **argv)
+static int conf_parse_args(char *key, char *value, int *argc, char **argv)
 {
 	char *start = NULL;
 	char *ptr = value;
@@ -205,12 +259,9 @@ int conf_parse_args(char *key, char *value, int *argc, char **argv)
 	return 0;
 }
 
-void load_exit(void)
-{
-	return;
-}
+void load_exit(void) {}
 
-int load_conf_printf(const char *file, int lineno, int ret)
+static int load_conf_printf(const char *file, int lineno, int ret)
 {
 	if (ret != CONF_RET_OK) {
 		printf("process config file '%s' failed at line %d.", file, lineno);
@@ -224,15 +275,15 @@ int load_conf_printf(const char *file, int lineno, int ret)
 	return 0;
 }
 
-int load_conf_file(const char *file, struct config_item *items, conf_error_handler handler)
+static int load_conf_file(const char *file, struct config_item *items, conf_error_handler handler)
 {
 	FILE *fp = NULL;
 	char line[MAX_LINE_LEN];
 	char key[MAX_KEY_LEN];
 	char value[MAX_LINE_LEN];
 	int filed_num = 0;
-	int i;
-	int argc;
+	int i = 0;
+	int argc = 0;
 	char *argv[1024];
 	int ret = 0;
 	int call_ret = 0;
@@ -262,6 +313,7 @@ int load_conf_file(const char *file, struct config_item *items, conf_error_handl
 
 		/* if field format is not key = value, error */
 		if (filed_num != 2) {
+			handler(file, line_no, CONF_RET_BADCONF);
 			goto errout;
 		}
 
@@ -281,7 +333,7 @@ int load_conf_file(const char *file, struct config_item *items, conf_error_handl
 
 			conf_getopt_reset();
 			/* call item function */
-			currrent_conf_file = file;
+			current_conf_file = file;
 			call_ret = items[i].item_func(items[i].item, items[i].data, argc, argv);
 			ret = handler(file, line_no, call_ret);
 			if (ret != 0) {

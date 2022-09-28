@@ -31,17 +31,19 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <libgen.h>
+#include <linux/capability.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
+#include <pwd.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <ucontext.h>
 
-#define RESOLVE_FILE "/etc/resolv.conf"
 #define SAMPLE_CONF_FILE "/opt/smartdns/smartdns.conf"
 #define MAX_LINE_LEN 1024
 #define MAX_KEY_LEN 64
@@ -49,6 +51,87 @@
 #define TMP_BUFF_LEN_32 32
 
 static int verbose_screen;
+
+int capget(struct __user_cap_header_struct *header, struct __user_cap_data_struct *cap);
+int capset(struct __user_cap_header_struct *header, struct __user_cap_data_struct *cap);
+
+static int get_uid_gid(int *uid, int *gid)
+{
+	struct passwd *result = NULL;
+	struct passwd pwd;
+	char *buf = NULL;
+	ssize_t bufsize = 0;
+	int ret = -1;
+
+	if (dns_conf_user[0] == '\0') {
+		return -1;
+	}
+
+	bufsize = sysconf(_SC_GETPW_R_SIZE_MAX);
+	if (bufsize == -1) {
+		bufsize = 1024 * 16;
+	}
+
+	buf = malloc(bufsize);
+	if (buf == NULL) {
+		goto out;
+	}
+
+	ret = getpwnam_r(dns_conf_user, &pwd, buf, bufsize, &result);
+	if (ret != 0) {
+		goto out;
+	}
+
+	if (result == NULL) {
+		ret = -1;
+		goto out;
+	}
+
+	*uid = result->pw_uid;
+	*gid = result->pw_gid;
+
+out:
+	if (buf) {
+		free(buf);
+	}
+
+	return ret;
+}
+
+static int drop_root_privilege(void)
+{
+	struct __user_cap_data_struct cap;
+	struct __user_cap_header_struct header;
+#ifdef _LINUX_CAPABILITY_VERSION_3
+	header.version = _LINUX_CAPABILITY_VERSION_3;
+#else
+	header.version = _LINUX_CAPABILITY_VERSION;
+#endif
+	header.pid = 0;
+	int uid = 0;
+	int gid = 0;
+	int unused __attribute__((unused)) = 0;
+
+	if (get_uid_gid(&uid, &gid) != 0) {
+		return -1;
+	}
+
+	if (capget(&header, &cap) < 0) {
+		return -1;
+	}
+
+	prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0);
+	cap.effective |= (1 << CAP_NET_RAW | 1 << CAP_NET_ADMIN);
+	cap.permitted |= (1 << CAP_NET_RAW | 1 << CAP_NET_ADMIN);
+	unused = setgid(gid);
+	unused = setuid(uid);
+	if (capset(&header, &cap) < 0) {
+		return -1;
+	}
+
+	prctl(PR_SET_KEEPCAPS, 0, 0, 0, 0);
+	return 0;
+}
 
 static void _help(void)
 {
@@ -58,7 +141,7 @@ static void _help(void)
 		"Start smartdns server.\n"
 		"  -f            run forground.\n"
 		"  -c [conf]     config file.\n"
-		"  -p [pid]      pid file path\n"
+		"  -p [pid]      pid file path, '-' means don't create pid file.\n"
 		"  -S            ignore segment fault signal.\n"
 		"  -x            verbose screen.\n"
 		"  -v            dispaly version.\n"
@@ -99,9 +182,9 @@ static int _smartdns_load_from_resolv(void)
 	int filed_num = 0;
 	int line_num = 0;
 
-	fp = fopen(RESOLVE_FILE, "r");
+	fp = fopen(dns_resolv_file, "r");
 	if (fp == NULL) {
-		tlog(TLOG_ERROR, "open %s failed, %s", RESOLVE_FILE, strerror(errno));
+		tlog(TLOG_ERROR, "open %s failed, %s", dns_resolv_file, strerror(errno));
 		return -1;
 	}
 
@@ -113,7 +196,7 @@ static int _smartdns_load_from_resolv(void)
 			continue;
 		}
 
-		if (strncmp(key, "nameserver", MAX_KEY_LEN) != 0) {
+		if (strncmp(key, "nameserver", MAX_KEY_LEN - 1) != 0) {
 			continue;
 		}
 
@@ -139,14 +222,14 @@ static int _smartdns_load_from_resolv(void)
 
 static int _smartdns_add_servers(void)
 {
-	int i = 0;
+	unsigned long i = 0;
 	int j = 0;
 	int ret = 0;
 	struct dns_server_groups *group = NULL;
 	struct dns_servers *server = NULL;
 	struct client_dns_server_flags flags;
 
-	for (i = 0; i < dns_conf_server_num; i++) {
+	for (i = 0; i < (unsigned int)dns_conf_server_num; i++) {
 		memset(&flags, 0, sizeof(flags));
 		switch (dns_conf_servers[i].type) {
 		case DNS_SERVER_UDP: {
@@ -249,14 +332,21 @@ static int _smartdns_destroy_ssl(void)
 	return 0;
 }
 
-static int _smartdns_init(void)
+static const char *_smartdns_log_path(void)
 {
-	int ret;
 	char *logfile = SMARTDNS_LOG_FILE;
 
 	if (dns_conf_log_file[0] != 0) {
 		logfile = dns_conf_log_file;
 	}
+
+	return logfile;
+}
+
+static int _smartdns_init(void)
+{
+	int ret = 0;
+	const char *logfile = _smartdns_log_path();
 
 	ret = tlog_init(logfile, dns_conf_log_size, dns_conf_log_num, 0, 0);
 	if (ret != 0) {
@@ -267,7 +357,7 @@ static int _smartdns_init(void)
 	tlog_setlogscreen(verbose_screen);
 	tlog_setlevel(dns_conf_log_level);
 
-	tlog(TLOG_NOTICE, "smartdns starting...(Copyright (C) Nick Peng <pymumu@gmail.com>, build:%s %s)", __DATE__,
+	tlog(TLOG_NOTICE, "smartdns starting...(Copyright (C) Nick Peng <pymumu@gmail.com>, build: %s %s)", __DATE__,
 		 __TIME__);
 
 	if (_smartdns_init_ssl() != 0) {
@@ -323,9 +413,10 @@ static int _smartdns_run(void)
 
 static void _smartdns_exit(void)
 {
-	dns_server_exit();
+	tlog(TLOG_INFO, "smartdns exit...");
 	dns_client_exit();
 	fast_ping_exit();
+	dns_server_exit();
 	_smartdns_destroy_ssl();
 	tlog_exit();
 	dns_server_load_exit();
@@ -333,6 +424,7 @@ static void _smartdns_exit(void)
 
 static void _sig_exit(int signo)
 {
+	tlog(TLOG_INFO, "stop smartdns by signal %d", signo);
 	dns_server_stop();
 }
 
@@ -375,7 +467,8 @@ static int sig_num = sizeof(sig_list) / sizeof(int);
 
 static void _reg_signal(void)
 {
-	struct sigaction act, old;
+	struct sigaction act;
+	struct sigaction old;
 	int i = 0;
 	act.sa_sigaction = _sig_error_exit;
 	sigemptyset(&act.sa_mask);
@@ -386,19 +479,61 @@ static void _reg_signal(void)
 	}
 }
 
+static int _smartdns_create_logdir(void)
+{
+	int uid = 0;
+	int gid = 0;
+	char logdir[PATH_MAX] = {0};
+	safe_strncpy(logdir, _smartdns_log_path(), PATH_MAX);
+	dirname(logdir);
+
+	if (access(logdir, F_OK) == 0) {
+		return 0;
+	}
+
+	if (mkdir(logdir, 0750) != 0) {
+		if (errno == EEXIST) {
+			return 0;
+		}
+
+		return -1;
+	}
+
+	int unused __attribute__((unused)) = 0;
+
+	if (get_uid_gid(&uid, &gid) != 0) {
+		return -1;
+	}
+
+	unused = chown(logdir, uid, gid);
+	return 0;
+}
+
+static int _smartdns_init_pre(void)
+{
+	_smartdns_create_logdir();
+
+	return 0;
+}
+
 int main(int argc, char *argv[])
 {
-	int ret;
+	int ret = 0;
 	int is_forground = 0;
-	int opt;
+	int opt = 0;
 	char config_file[MAX_LINE_LEN];
 	char pid_file[MAX_LINE_LEN];
 	int signal_ignore = 0;
+	sigset_t empty_sigblock;
 
 	safe_strncpy(config_file, SMARTDNS_CONF_FILE, MAX_LINE_LEN);
 	safe_strncpy(pid_file, SMARTDNS_PID_FILE, MAX_LINE_LEN);
 
-	while ((opt = getopt(argc, argv, "fhc:p:Svx")) != -1) {
+	/* patch for Asus router:  unblock all signal*/
+	sigemptyset(&empty_sigblock);
+	sigprocmask(SIG_SETMASK, &empty_sigblock, NULL);
+
+	while ((opt = getopt(argc, argv, "fhc:p:SvxN:")) != -1) {
 		switch (opt) {
 		case 'f':
 			is_forground = 1;
@@ -419,10 +554,19 @@ int main(int argc, char *argv[])
 			_show_version();
 			return 0;
 			break;
+#ifdef DEBUG
+		case 'N':
+			return dns_packet_debug(optarg);
+#endif
 		case 'h':
 			_help();
 			return 1;
 		}
+	}
+
+	if (dns_server_load_conf(config_file) != 0) {
+		fprintf(stderr, "load config failed.\n");
+		goto errout;
 	}
 
 	if (is_forground == 0) {
@@ -436,7 +580,7 @@ int main(int argc, char *argv[])
 		_reg_signal();
 	}
 
-	if (create_pid_file(pid_file) != 0) {
+	if (strncmp(pid_file, "-", 2) != 0 && create_pid_file(pid_file) != 0) {
 		goto errout;
 	}
 
@@ -445,10 +589,15 @@ int main(int argc, char *argv[])
 	}
 
 	signal(SIGPIPE, SIG_IGN);
-	if (dns_server_load_conf(config_file) != 0) {
-		fprintf(stderr, "load config failed.\n");
-		goto errout;
+	signal(SIGINT, _sig_exit);
+	signal(SIGTERM, _sig_exit);
+
+	if (_smartdns_init_pre() != 0) {
+		fprintf(stderr, "init failed.\n");
+		return 1;
 	}
+
+	drop_root_privilege();
 
 	ret = _smartdns_init();
 	if (ret != 0) {
@@ -456,8 +605,6 @@ int main(int argc, char *argv[])
 		goto errout;
 	}
 
-	signal(SIGINT, _sig_exit);
-	signal(SIGTERM, _sig_exit);
 	atexit(_smartdns_exit);
 
 	return _smartdns_run();
