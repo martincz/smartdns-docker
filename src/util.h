@@ -47,9 +47,7 @@ extern "C" {
 #define MAX_IP_LEN 64
 
 #ifndef BASE_FILE_NAME
-#define BASE_FILE_NAME                                                     \
-  (__builtin_strrchr(__FILE__, '/') ? __builtin_strrchr(__FILE__, '/') + 1 \
-                                    : __FILE__)
+#define BASE_FILE_NAME (__builtin_strrchr(__FILE__, '/') ? __builtin_strrchr(__FILE__, '/') + 1 : __FILE__)
 #endif
 #define BUG(format, ...) bug_ext(BASE_FILE_NAME, __LINE__, __func__, format, ##__VA_ARGS__)
 

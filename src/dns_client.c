@@ -184,8 +184,9 @@ struct dns_client {
 	int ssl_verify_skip;
 
 	/* query list */
-	pthread_mutex_t dns_request_lock;
 	struct list_head dns_request_list;
+	pthread_cond_t run_cond;
+	atomic_t run_period;
 	atomic_t dns_server_num;
 
 	/* ECS */
@@ -1312,7 +1313,12 @@ static int _dns_client_server_pending(char *server_ip, int port, dns_server_type
 
 	pthread_mutex_lock(&pending_server_mutex);
 	list_add_tail(&pending->list, &pending_servers);
+	atomic_set(&client.run_period, 1);
 	pthread_mutex_unlock(&pending_server_mutex);
+
+	pthread_mutex_lock(&client.domain_map_lock);
+	pthread_cond_signal(&client.run_cond);
+	pthread_mutex_unlock(&client.domain_map_lock);
 	return 0;
 errout:
 	if (pending) {
@@ -3129,7 +3135,13 @@ int dns_client_query(const char *domain, int qtype, dns_client_callback callback
 	}
 
 	pthread_mutex_lock(&client.domain_map_lock);
-	list_add_tail(&query->dns_request_list, &client.dns_request_list);
+	if (hash_hashed(&query->domain_node)) {
+		if (list_empty(&client.dns_request_list)) {
+			pthread_cond_signal(&client.run_cond);
+		}
+
+		list_add_tail(&query->dns_request_list, &client.dns_request_list);
+	}
 	pthread_mutex_unlock(&client.domain_map_lock);
 
 	tlog(TLOG_INFO, "send request %s, qtype %d, id %d\n", domain, qtype, query->sid);
@@ -3262,6 +3274,12 @@ static void _dns_client_add_pending_servers(void)
 	dely = 0;
 
 	pthread_mutex_lock(&pending_server_mutex);
+	if (list_empty(&pending_servers)) {
+		atomic_set(&client.run_period, 0);
+	} else {
+		atomic_set(&client.run_period, 1);
+	}
+
 	list_for_each_entry_safe(pending, tmp, &pending_servers, list)
 	{
 		list_add(&pending->retry_list, &retry_list);
@@ -3402,15 +3420,25 @@ static void *_dns_client_work(void *arg)
 	int num = 0;
 	int i = 0;
 	unsigned long now = {0};
+	unsigned long last = {0};
 	unsigned int sleep = 100;
 	int sleep_time = 0;
 	unsigned long expect_time = 0;
 
 	sleep_time = sleep;
 	now = get_tick_count() - sleep;
+	last = now;
 	expect_time = now + sleep;
 	while (atomic_read(&client.run)) {
 		now = get_tick_count();
+		if (sleep_time > 0) {
+			sleep_time -= now - last;
+			if (sleep_time <= 0) {
+				sleep_time = 0;
+			}
+		}
+		last = now;
+
 		if (now >= expect_time) {
 			_dns_client_period_run();
 			sleep_time = sleep - (now - expect_time);
@@ -3420,6 +3448,15 @@ static void *_dns_client_work(void *arg)
 			}
 			expect_time += sleep;
 		}
+
+		pthread_mutex_lock(&client.domain_map_lock);
+		if (list_empty(&client.dns_request_list) && atomic_read(&client.run_period) == 0) {
+			pthread_cond_wait(&client.run_cond, &client.domain_map_lock);
+			expect_time = get_tick_count();
+			pthread_mutex_unlock(&client.domain_map_lock);
+			continue;
+		}
+		pthread_mutex_unlock(&client.domain_map_lock);
 
 		num = epoll_wait(client.epoll_fd, events, DNS_MAX_EVENTS, sleep_time);
 		if (num < 0) {
@@ -3496,6 +3533,7 @@ int dns_client_init(void)
 	memset(&client, 0, sizeof(client));
 	pthread_attr_init(&attr);
 	atomic_set(&client.dns_server_num, 0);
+	atomic_set(&client.run_period, 0);
 
 	epollfd = epoll_create1(EPOLL_CLOEXEC);
 	if (epollfd < 0) {
@@ -3510,6 +3548,8 @@ int dns_client_init(void)
 	hash_init(client.domain_map);
 	hash_init(client.group);
 	INIT_LIST_HEAD(&client.dns_request_list);
+
+	pthread_cond_init(&client.run_cond, NULL);
 
 	if (dns_client_add_group(DNS_SERVER_GROUP_DEFAULT) != 0) {
 		tlog(TLOG_ERROR, "add default server group failed.");
@@ -3542,6 +3582,7 @@ errout:
 
 	pthread_mutex_destroy(&client.server_list_lock);
 	pthread_mutex_destroy(&client.domain_map_lock);
+	pthread_cond_destroy(&client.run_cond);
 
 	return -1;
 }
@@ -3551,6 +3592,9 @@ void dns_client_exit(void)
 	if (client.tid) {
 		void *ret = NULL;
 		atomic_set(&client.run, 0);
+		pthread_mutex_lock(&client.domain_map_lock);
+		pthread_cond_signal(&client.run_cond);
+		pthread_mutex_unlock(&client.domain_map_lock);
 		pthread_join(client.tid, &ret);
 		client.tid = 0;
 	}
@@ -3563,6 +3607,7 @@ void dns_client_exit(void)
 
 	pthread_mutex_destroy(&client.server_list_lock);
 	pthread_mutex_destroy(&client.domain_map_lock);
+	pthread_cond_destroy(&client.run_cond);
 	if (client.ssl_ctx) {
 		SSL_CTX_free(client.ssl_ctx);
 		client.ssl_ctx = NULL;

@@ -19,6 +19,7 @@
 #include "fast_ping.h"
 #include "atomic.h"
 #include "hashtable.h"
+#include "list.h"
 #include "tlog.h"
 #include "util.h"
 #include <arpa/inet.h>
@@ -36,6 +37,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -62,6 +65,9 @@ struct ping_dns_head {
 	unsigned short ancount;
 	unsigned short aucount;
 	unsigned short adcount;
+	char qd_name;
+	unsigned short q_qtype;
+	unsigned short q_qclass;
 } __attribute__((packed));
 
 typedef enum FAST_PING_TYPE {
@@ -123,6 +129,15 @@ struct ping_host_struct {
 	struct fast_ping_packet packet;
 };
 
+struct fast_ping_notify_event {
+	struct list_head list;
+	struct ping_host_struct *ping_host;
+	FAST_PING_RESULT ping_result;
+	unsigned int seq;
+	int ttl;
+	struct timeval tvresult;
+};
+
 struct fast_ping_struct {
 	atomic_t run;
 	pthread_t tid;
@@ -140,6 +155,12 @@ struct fast_ping_struct {
 	int fd_udp6;
 	struct ping_host_struct udp6_host;
 
+	int event_fd;
+	pthread_t notify_tid;
+	pthread_cond_t notify_cond;
+	pthread_mutex_t notify_lock;
+	struct list_head notify_event_list;
+
 	pthread_mutex_t map_lock;
 	DECLARE_HASHTABLE(addrmap, 6);
 };
@@ -147,6 +168,15 @@ struct fast_ping_struct {
 static struct fast_ping_struct ping;
 static atomic_t ping_sid = ATOMIC_INIT(0);
 static int bool_print_log = 1;
+
+static void _fast_ping_host_put(struct ping_host_struct *ping_host);
+
+static void _fast_ping_wakup_thread(void)
+{
+	uint64_t u = 1;
+	int unused __attribute__((unused));
+	unused = write(ping.event_fd, &u, sizeof(u));
+}
 
 static uint16_t _fast_ping_checksum(uint16_t *header, size_t len)
 {
@@ -365,6 +395,53 @@ static void _fast_ping_close_host_sock(struct ping_host_struct *ping_host)
 	ping_host->fd = -1;
 }
 
+static void _fast_ping_release_notify_event(struct fast_ping_notify_event *ping_notify_event)
+{
+	pthread_mutex_lock(&ping.notify_lock);
+	list_del_init(&ping_notify_event->list);
+	pthread_mutex_unlock(&ping.notify_lock);
+
+	if (ping_notify_event->ping_host) {
+		_fast_ping_host_put(ping_notify_event->ping_host);
+		ping_notify_event->ping_host = NULL;
+	}
+	free(ping_notify_event);
+}
+
+static int _fast_ping_send_notify_event(struct ping_host_struct *ping_host, FAST_PING_RESULT ping_result,
+										unsigned int seq, int ttl, struct timeval *tvresult)
+{
+	struct fast_ping_notify_event *notify_event = NULL;
+
+	notify_event = malloc(sizeof(struct fast_ping_notify_event));
+	if (notify_event == NULL) {
+		goto errout;
+	}
+	memset(notify_event, 0, sizeof(struct fast_ping_notify_event));
+	INIT_LIST_HEAD(&notify_event->list);
+	notify_event->seq = seq;
+	notify_event->ttl = ttl;
+	notify_event->ping_result = ping_result;
+	notify_event->tvresult = *tvresult;
+
+	pthread_mutex_lock(&ping.notify_lock);
+	if (list_empty(&ping.notify_event_list)) {
+		pthread_cond_signal(&ping.notify_cond);
+	}
+	list_add_tail(&notify_event->list, &ping.notify_event_list);
+	notify_event->ping_host = ping_host;
+	_fast_ping_host_get(ping_host);
+	pthread_mutex_unlock(&ping.notify_lock);
+
+	return 0;
+
+errout:
+	if (notify_event) {
+		_fast_ping_release_notify_event(notify_event);
+	}
+	return -1;
+}
+
 static void _fast_ping_host_put(struct ping_host_struct *ping_host)
 {
 	int ref_cnt = atomic_dec_and_test(&ping_host->ref);
@@ -387,8 +464,7 @@ static void _fast_ping_host_put(struct ping_host_struct *ping_host)
 		tv.tv_sec = 0;
 		tv.tv_usec = 0;
 
-		ping_host->ping_callback(ping_host, ping_host->host, PING_RESULT_END, &ping_host->addr, ping_host->addr_len,
-								 ping_host->seq, ping_host->ttl, &tv, ping_host->error, ping_host->userptr);
+		_fast_ping_send_notify_event(ping_host, PING_RESULT_END, ping_host->seq, ping_host->ttl, &tv);
 	}
 
 	tlog(TLOG_DEBUG, "ping %s end, id %d", ping_host->host, ping_host->sid);
@@ -414,8 +490,7 @@ static void _fast_ping_host_remove(struct ping_host_struct *ping_host)
 		tv.tv_sec = 0;
 		tv.tv_usec = 0;
 
-		ping_host->ping_callback(ping_host, ping_host->host, PING_RESULT_END, &ping_host->addr, ping_host->addr_len,
-								 ping_host->seq, ping_host->ttl, &tv, ping_host->error, ping_host->userptr);
+		_fast_ping_send_notify_event(ping_host, PING_RESULT_END, ping_host->seq, ping_host->ttl, &tv);
 	}
 
 	_fast_ping_host_put(ping_host);
@@ -537,6 +612,11 @@ static int _fast_ping_sendping_udp(struct ping_host_struct *ping_host)
 	memset(&dns_head, 0, sizeof(dns_head));
 	dns_head.id = htons(ping_host->sid);
 	dns_head.flag = flag;
+	dns_head.qdcount = htons(1);
+	dns_head.qd_name = 0;
+	dns_head.q_qtype = htons(2); /* DNS_T_NS */
+	dns_head.q_qclass = htons(1);
+
 	gettimeofday(&ping_host->last, NULL);
 	len = sendto(fd, &dns_head, sizeof(dns_head), 0, &ping_host->addr, ping_host->addr_len);
 	if (len < 0 || len != sizeof(dns_head)) {
@@ -646,6 +726,8 @@ static int _fast_ping_sendping(struct ping_host_struct *ping_host)
 	if (ret != 0) {
 		ping_host->error = errno;
 		return ret;
+	} else {
+		ping_host->error = 0;
 	}
 
 	return 0;
@@ -1122,6 +1204,9 @@ struct ping_host_struct *fast_ping_start(PING_TYPE type, const char *host, int c
 
 	pthread_mutex_lock(&ping.map_lock);
 	_fast_ping_host_get(ping_host);
+	if (hash_empty(ping.addrmap)) {
+		_fast_ping_wakup_thread();
+	}
 	hash_add(ping.addrmap, &ping_host->addr_node, addrkey);
 	ping_host->run = 1;
 	pthread_mutex_unlock(&ping.map_lock);
@@ -1194,7 +1279,7 @@ static struct fast_ping_packet *_fast_ping_icmp6_packet(struct ping_host_struct 
 
 	packet->ttl = hops;
 	if (icmp6->icmp6_type != ICMP6_ECHO_REPLY) {
-		tlog(TLOG_DEBUG, "icmp6 type faild, %d:%d", icmp6->icmp6_type, ICMP6_ECHO_REPLY);
+		errno = ENETUNREACH;
 		return NULL;
 	}
 
@@ -1235,7 +1320,7 @@ static struct fast_ping_packet *_fast_ping_icmp_packet(struct ping_host_struct *
 	}
 
 	if (icmp->icmp_type != ICMP_ECHOREPLY) {
-		tlog(TLOG_DEBUG, "icmp type faild, %d:%d", icmp->icmp_type, ICMP_ECHOREPLY);
+		errno = ENETUNREACH;
 		return NULL;
 	}
 
@@ -1317,6 +1402,10 @@ static int _fast_ping_process_icmp(struct ping_host_struct *ping_host, struct ti
 	packet = _fast_ping_recv_packet(ping_host, &msg, inpacket, len, now);
 	if (packet == NULL) {
 		char name[PING_MAX_HOSTLEN];
+		if (errno == ENETUNREACH) {
+			goto errout;
+		}
+
 		tlog(TLOG_DEBUG, "recv ping packet from %s failed.",
 			 gethost_by_addr(name, sizeof(name), (struct sockaddr *)&from));
 		goto errout;
@@ -1353,9 +1442,8 @@ static int _fast_ping_process_icmp(struct ping_host_struct *ping_host, struct ti
 	recv_ping_host->ttl = packet->ttl;
 	tv_sub(&tvresult, tvsend);
 	if (recv_ping_host->ping_callback) {
-		recv_ping_host->ping_callback(recv_ping_host, recv_ping_host->host, PING_RESULT_RESPONSE, &recv_ping_host->addr,
-									  recv_ping_host->addr_len, recv_ping_host->seq, recv_ping_host->ttl, &tvresult,
-									  ping_host->error, recv_ping_host->userptr);
+		_fast_ping_send_notify_event(recv_ping_host, PING_RESULT_RESPONSE, recv_ping_host->seq, recv_ping_host->ttl,
+									 &tvresult);
 	}
 
 	recv_ping_host->send = 0;
@@ -1388,9 +1476,7 @@ static int _fast_ping_process_tcp(struct ping_host_struct *ping_host, struct epo
 	}
 	tv_sub(&tvresult, tvsend);
 	if (ping_host->ping_callback) {
-		ping_host->ping_callback(ping_host, ping_host->host, PING_RESULT_RESPONSE, &ping_host->addr,
-								 ping_host->addr_len, ping_host->seq, ping_host->ttl, &tvresult, ping_host->error,
-								 ping_host->userptr);
+		_fast_ping_send_notify_event(ping_host, PING_RESULT_RESPONSE, ping_host->seq, ping_host->ttl, &tvresult);
 	}
 
 	ping_host->send = 0;
@@ -1484,9 +1570,8 @@ static int _fast_ping_process_udp(struct ping_host_struct *ping_host, struct tim
 	tvsend = &recv_ping_host->last;
 	tv_sub(&tvresult, tvsend);
 	if (recv_ping_host->ping_callback) {
-		recv_ping_host->ping_callback(recv_ping_host, recv_ping_host->host, PING_RESULT_RESPONSE, &recv_ping_host->addr,
-									  recv_ping_host->addr_len, recv_ping_host->seq, recv_ping_host->ttl, &tvresult,
-									  ping_host->error, recv_ping_host->userptr);
+		_fast_ping_send_notify_event(recv_ping_host, PING_RESULT_RESPONSE, recv_ping_host->seq, recv_ping_host->ttl,
+									 &tvresult);
 	}
 
 	recv_ping_host->send = 0;
@@ -1593,9 +1678,7 @@ static void _fast_ping_period_run(void)
 		tv_sub(&interval, &ping_host->last);
 		millisecond = interval.tv_sec * 1000 + interval.tv_usec / 1000;
 		if (millisecond >= ping_host->timeout && ping_host->send == 1) {
-			ping_host->ping_callback(ping_host, ping_host->host, PING_RESULT_TIMEOUT, &ping_host->addr,
-									 ping_host->addr_len, ping_host->seq, ping_host->ttl, &interval, ping_host->error,
-									 ping_host->userptr);
+			_fast_ping_send_notify_event(ping_host, PING_RESULT_TIMEOUT, ping_host->seq, ping_host->ttl, &interval);
 			ping_host->send = 0;
 		}
 
@@ -1621,22 +1704,84 @@ static void _fast_ping_period_run(void)
 	}
 }
 
+static void _fast_ping_process_notify_event(struct fast_ping_notify_event *ping_notify_event)
+{
+	struct ping_host_struct *ping_host = ping_notify_event->ping_host;
+	if (ping_host == NULL) {
+		return;
+	}
+
+	ping_host->ping_callback(ping_host, ping_host->host, ping_notify_event->ping_result, &ping_host->addr,
+							 ping_host->addr_len, ping_notify_event->seq, ping_notify_event->ttl,
+							 &ping_notify_event->tvresult, ping_host->error, ping_host->userptr);
+}
+
+static void *_fast_ping_notify_worker(void *arg)
+{
+	struct fast_ping_notify_event *ping_notify_event = NULL;
+
+	while (atomic_read(&ping.run)) {
+		pthread_mutex_lock(&ping.notify_lock);
+		if (list_empty(&ping.notify_event_list)) {
+			pthread_cond_wait(&ping.notify_cond, &ping.notify_lock);
+		}
+
+		ping_notify_event = list_first_entry_or_null(&ping.notify_event_list, struct fast_ping_notify_event, list);
+		if (ping_notify_event) {
+			list_del_init(&ping_notify_event->list);
+		}
+		pthread_mutex_unlock(&ping.notify_lock);
+
+		if (ping_notify_event == NULL) {
+			continue;
+		}
+
+		_fast_ping_process_notify_event(ping_notify_event);
+		_fast_ping_release_notify_event(ping_notify_event);
+	}
+
+	return NULL;
+}
+
+static void _fast_ping_remove_all_notify_event(void)
+{
+	struct fast_ping_notify_event *notify_event = NULL;
+	struct fast_ping_notify_event *tmp = NULL;
+	list_for_each_entry_safe(notify_event, tmp, &ping.notify_event_list, list)
+	{
+		_fast_ping_process_notify_event(notify_event);
+		_fast_ping_release_notify_event(notify_event);
+	}
+}
+
 static void *_fast_ping_work(void *arg)
 {
 	struct epoll_event events[PING_MAX_EVENTS + 1];
 	int num = 0;
 	int i = 0;
 	unsigned long now = {0};
+	unsigned long last = {0};
 	struct timeval tvnow = {0};
 	int sleep = 100;
 	int sleep_time = 0;
 	unsigned long expect_time = 0;
 
+	setpriority(PRIO_PROCESS, 0, -5);
+
 	sleep_time = sleep;
 	now = get_tick_count() - sleep;
+	last = now;
 	expect_time = now + sleep;
 	while (atomic_read(&ping.run)) {
 		now = get_tick_count();
+		if (sleep_time > 0) {
+			sleep_time -= now - last;
+			if (sleep_time <= 0) {
+				sleep_time = 0;
+			}
+		}
+		last = now;
+
 		if (now >= expect_time) {
 			_fast_ping_period_run();
 			sleep_time = sleep - (now - expect_time);
@@ -1647,10 +1792,20 @@ static void *_fast_ping_work(void *arg)
 			expect_time += sleep;
 		}
 
+		pthread_mutex_lock(&ping.map_lock);
+		if (hash_empty(ping.addrmap)) {
+			sleep_time = -1;
+		}
+		pthread_mutex_unlock(&ping.map_lock);
+
 		num = epoll_wait(ping.epoll_fd, events, PING_MAX_EVENTS, sleep_time);
 		if (num < 0) {
 			usleep(100000);
 			continue;
+		}
+
+		if (sleep_time == -1) {
+			expect_time = get_tick_count();
 		}
 
 		if (num == 0) {
@@ -1660,6 +1815,14 @@ static void *_fast_ping_work(void *arg)
 		gettimeofday(&tvnow, NULL);
 		for (i = 0; i < num; i++) {
 			struct epoll_event *event = &events[i];
+			/* read event */
+			if (event->data.fd == ping.event_fd) {
+				uint64_t value;
+				int unused __attribute__((unused));
+				unused = read(ping.event_fd, &value, sizeof(uint64_t));
+				continue;
+			}
+
 			struct ping_host_struct *ping_host = (struct ping_host_struct *)event->data.ptr;
 			_fast_ping_process(ping_host, event, &tvnow);
 		}
@@ -1669,6 +1832,31 @@ static void *_fast_ping_work(void *arg)
 	ping.epoll_fd = -1;
 
 	return NULL;
+}
+
+static int _fast_ping_init_wakeup_event(void)
+{
+	int fdevent = -1;
+	fdevent = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+	if (fdevent < 0) {
+		tlog(TLOG_ERROR, "create eventfd failed, %s\n", strerror(errno));
+		goto errout;
+	}
+
+	struct epoll_event event;
+	memset(&event, 0, sizeof(event));
+	event.events = EPOLLIN | EPOLLERR;
+	event.data.fd = fdevent;
+	if (epoll_ctl(ping.epoll_fd, EPOLL_CTL_ADD, fdevent, &event) != 0) {
+		tlog(TLOG_ERROR, "set eventfd failed, %s\n", strerror(errno));
+		goto errout;
+	}
+
+	ping.event_fd = fdevent;
+
+	return 0;
+errout:
+	return -1;
 }
 
 int fast_ping_init(void)
@@ -1693,32 +1881,67 @@ int fast_ping_init(void)
 
 	pthread_mutex_init(&ping.map_lock, NULL);
 	pthread_mutex_init(&ping.lock, NULL);
+	pthread_mutex_init(&ping.notify_lock, NULL);
+	pthread_cond_init(&ping.notify_cond, NULL);
+
+	INIT_LIST_HEAD(&ping.notify_event_list);
+
 	hash_init(ping.addrmap);
-	ping.epoll_fd = epollfd;
 	ping.no_unprivileged_ping = !has_unprivileged_ping();
 	ping.ident = (getpid() & 0XFFFF);
 	atomic_set(&ping.run, 1);
+
 	ret = pthread_create(&ping.tid, &attr, _fast_ping_work, NULL);
 	if (ret != 0) {
-		tlog(TLOG_ERROR, "create ping work thread failed, %s\n", strerror(errno));
+		tlog(TLOG_ERROR, "create ping work thread failed, %s\n", strerror(ret));
+		goto errout;
+	}
+
+	ret = pthread_create(&ping.notify_tid, &attr, _fast_ping_notify_worker, NULL);
+	if (ret != 0) {
+		tlog(TLOG_ERROR, "create ping notifyer work thread failed, %s\n", strerror(ret));
+		goto errout;
+	}
+
+	ping.epoll_fd = epollfd;
+	ret = _fast_ping_init_wakeup_event();
+	if (ret != 0) {
+		tlog(TLOG_ERROR, "init wakeup event failed, %s\n", strerror(errno));
 		goto errout;
 	}
 
 	return 0;
 errout:
+	if (ping.notify_tid) {
+		void *retval = NULL;
+		atomic_set(&ping.run, 0);
+		pthread_cond_signal(&ping.notify_cond);
+		pthread_join(ping.notify_tid, &retval);
+		ping.notify_tid = 0;
+	}
+
 	if (ping.tid) {
 		void *retval = NULL;
 		atomic_set(&ping.run, 0);
+		_fast_ping_wakup_thread();
 		pthread_join(ping.tid, &retval);
 		ping.tid = 0;
 	}
 
-	if (epollfd) {
+	if (epollfd > 0) {
 		close(epollfd);
 	}
 
+	if (ping.event_fd) {
+		close(ping.event_fd);
+		ping.event_fd = -1;
+	}
+
+	pthread_cond_destroy(&ping.notify_cond);
+	pthread_mutex_destroy(&ping.notify_lock);
 	pthread_mutex_destroy(&ping.lock);
 	pthread_mutex_destroy(&ping.map_lock);
+	memset(&ping, 0, sizeof(ping));
 
 	return -1;
 }
@@ -1748,16 +1971,33 @@ static void _fast_ping_close_fds(void)
 
 void fast_ping_exit(void)
 {
+	if (ping.notify_tid) {
+		void *retval = NULL;
+		atomic_set(&ping.run, 0);
+		pthread_cond_signal(&ping.notify_cond);
+		pthread_join(ping.notify_tid, &retval);
+		ping.notify_tid = 0;
+	}
+
 	if (ping.tid) {
 		void *ret = NULL;
 		atomic_set(&ping.run, 0);
+		_fast_ping_wakup_thread();
 		pthread_join(ping.tid, &ret);
 		ping.tid = 0;
 	}
 
+	if (ping.event_fd > 0) {
+		close(ping.event_fd);
+		ping.event_fd = -1;
+	}
+
 	_fast_ping_close_fds();
 	_fast_ping_remove_all();
+	_fast_ping_remove_all_notify_event();
 
+	pthread_cond_destroy(&ping.notify_cond);
+	pthread_mutex_destroy(&ping.notify_lock);
 	pthread_mutex_destroy(&ping.lock);
 	pthread_mutex_destroy(&ping.map_lock);
 }
