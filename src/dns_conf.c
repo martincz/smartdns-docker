@@ -105,6 +105,7 @@ int dns_conf_log_level = TLOG_ERROR;
 char dns_conf_log_file[DNS_MAX_PATH];
 size_t dns_conf_log_size = 1024 * 1024;
 int dns_conf_log_num = 8;
+int dns_conf_log_file_mode;
 
 /* CA file */
 char dns_conf_ca_file[DNS_MAX_PATH];
@@ -119,6 +120,7 @@ int dns_conf_audit_log_SOA;
 char dns_conf_audit_file[DNS_MAX_PATH];
 size_t dns_conf_audit_size = 1024 * 1024;
 int dns_conf_audit_num = 2;
+int dns_conf_audit_file_mode;
 
 /* address rules */
 art_tree dns_conf_domain_rule;
@@ -370,6 +372,7 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 		{"tls-host-verify", required_argument, NULL, 'V' }, /* verify tls hostname */
 		{"group", required_argument, NULL, 'g'}, /* add to group */
 		{"exclude-default-group", no_argument, NULL, 'E'}, /* ecluse this from default group */
+		{"set-mark", required_argument, NULL, 254}, /* set mark */
 		{NULL, no_argument, NULL, 0}
 	};
 	/* clang-format on */
@@ -390,6 +393,7 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 	server->hostname[0] = '\0';
 	server->httphost[0] = '\0';
 	server->tls_host_verify[0] = '\0';
+	server->set_mark = -1;
 
 	if (type == DNS_SERVER_HTTPS) {
 		if (parse_uri(ip, NULL, server->server, &port, server->path) != 0) {
@@ -467,6 +471,10 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 			server->skip_check_cert = 1;
 			break;
 		}
+		case 254: {
+			server->set_mark = atoll(optarg);
+			break;
+		}
 		default:
 			break;
 		}
@@ -533,7 +541,7 @@ static void _config_address_destroy(radix_node_t *node, void *cbctx)
 	node->data = NULL;
 }
 
-static int _config_domain_set_rule_add_ext(char *set_name, enum domain_rule type, void *rule, unsigned int flags,
+static int _config_domain_set_rule_add_ext(const char *set_name, enum domain_rule type, void *rule, unsigned int flags,
 										   int is_clear_flag)
 {
 	struct dns_domain_set_rule *set_rule = NULL;
@@ -587,7 +595,7 @@ errout:
 	return -1;
 }
 
-static int _config_domian_set_rule_flags(char *set_name, unsigned int flags, int is_clear_flag)
+static int _config_domian_set_rule_flags(const char *set_name, unsigned int flags, int is_clear_flag)
 {
 	return _config_domain_set_rule_add_ext(set_name, DOMAIN_RULE_FLAGS, NULL, flags, is_clear_flag);
 }
@@ -664,7 +672,7 @@ errout:
 	return -1;
 }
 
-static int _config_domain_rule_flag_set(char *domain, unsigned int flag, unsigned int is_clear)
+static int _config_domain_rule_flag_set(const char *domain, unsigned int flag, unsigned int is_clear)
 {
 	struct dns_domain_rule *domain_rule = NULL;
 	struct dns_domain_rule *old_domain_rule = NULL;
@@ -1842,6 +1850,11 @@ errout:
 	return -1;
 }
 
+static int _conf_domain_rule_no_serve_expired(const char *domain)
+{
+	return _config_domain_rule_flag_set(domain, DOMAIN_FLAG_NO_SERVE_EXPIRED, 0);
+}
+
 static int _conf_domain_rules(void *data, int argc, char *argv[])
 {
 	int opt = 0;
@@ -1856,6 +1869,7 @@ static int _conf_domain_rules(void *data, int argc, char *argv[])
 		{"nftset", required_argument, NULL, 't'},
 		{"nameserver", required_argument, NULL, 'n'},
 		{"dualstack-ip-selection", required_argument, NULL, 'd'},
+		{"no-serve-expired", no_argument, NULL, 254},
 		{NULL, no_argument, NULL, 0}
 	};
 	/* clang-format on */
@@ -1872,7 +1886,7 @@ static int _conf_domain_rules(void *data, int argc, char *argv[])
 	/* process extra options */
 	optind = 1;
 	while (1) {
-		opt = getopt_long_only(argc, argv, "c:a:p:n:d:", long_options, NULL);
+		opt = getopt_long_only(argc, argv, "c:a:p:t:n:d:", long_options, NULL);
 		if (opt == -1) {
 			break;
 		}
@@ -1947,6 +1961,14 @@ static int _conf_domain_rules(void *data, int argc, char *argv[])
 
 			if (_conf_domain_rule_nftset(domain, nftsetname) != 0) {
 				tlog(TLOG_ERROR, "add nftset rule failed.");
+				goto errout;
+			}
+
+			break;
+		}
+		case 254: {
+			if (_conf_domain_rule_no_serve_expired(domain) != 0) {
+				tlog(TLOG_ERROR, "set no-serve-expired rule failed.");
 				goto errout;
 			}
 
@@ -2400,9 +2422,11 @@ static struct config_item _config_item[] = {
 	CONF_STRING("log-file", (char *)dns_conf_log_file, DNS_MAX_PATH),
 	CONF_SIZE("log-size", &dns_conf_log_size, 0, 1024 * 1024 * 1024),
 	CONF_INT("log-num", &dns_conf_log_num, 0, 1024),
+	CONF_INT_BASE("log-file-mode", &dns_conf_log_file_mode, 0, 511, 8),
 	CONF_YESNO("audit-enable", &dns_conf_audit_enable),
 	CONF_YESNO("audit-SOA", &dns_conf_audit_log_SOA),
 	CONF_STRING("audit-file", (char *)&dns_conf_audit_file, DNS_MAX_PATH),
+	CONF_INT_BASE("audit-file-mode", &dns_conf_audit_file_mode, 0, 511, 8),
 	CONF_SIZE("audit-size", &dns_conf_audit_size, 0, 1024 * 1024 * 1024),
 	CONF_INT("audit-num", &dns_conf_audit_num, 0, 1024),
 	CONF_INT("rr-ttl", &dns_conf_rr_ttl, 0, CONF_INT_MAX),

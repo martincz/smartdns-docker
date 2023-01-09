@@ -93,6 +93,7 @@ struct dns_server_info {
 	int port;
 	/* server type */
 	dns_server_type_t type;
+	long long so_mark;
 
 	/* client socket */
 	int fd;
@@ -1045,6 +1046,7 @@ static int _dns_client_server_add(char *server_ip, char *server_host, int port, 
 	server_info->ttl_range = 0;
 	server_info->skip_check_cert = skip_check_cert;
 	server_info->prohibit = 0;
+	server_info->so_mark = flags->set_mark;
 	pthread_mutex_init(&server_info->lock, NULL);
 	memcpy(&server_info->flags, flags, sizeof(server_info->flags));
 
@@ -1683,8 +1685,25 @@ static int _dns_client_create_socket_udp(struct dns_server_info *server_info)
 		goto errout;
 	}
 
+	if (set_fd_nonblock(fd, 1) != 0) {
+		tlog(TLOG_ERROR, "set socket non block failed, %s", strerror(errno));
+		goto errout;
+	}
+
 	server_info->fd = fd;
 	server_info->status = DNS_SERVER_STATUS_CONNECTIONLESS;
+
+	if (connect(fd, &server_info->addr, server_info->ai_addrlen) != 0) {
+		if (errno == ENETUNREACH || errno == EHOSTUNREACH || errno == ECONNREFUSED) {
+			tlog(TLOG_WARN, "connect %s failed, %s", server_info->ip, strerror(errno));
+			goto errout;
+		}
+
+		if (errno != EINPROGRESS) {
+			tlog(TLOG_ERROR, "connect %s failed, %s", server_info->ip, strerror(errno));
+			goto errout;
+		}
+	}
 
 	memset(&event, 0, sizeof(event));
 	event.events = EPOLLIN;
@@ -1692,6 +1711,13 @@ static int _dns_client_create_socket_udp(struct dns_server_info *server_info)
 	if (epoll_ctl(client.epoll_fd, EPOLL_CTL_ADD, fd, &event) != 0) {
 		tlog(TLOG_ERROR, "epoll ctl failed.");
 		return -1;
+	}
+
+	if (server_info->so_mark >= 0) {
+		unsigned int so_mark = server_info->so_mark;
+		if (setsockopt(fd, SOL_SOCKET, SO_MARK, &so_mark, sizeof(so_mark)) != 0) {
+			tlog(TLOG_DEBUG, "set socket mark failed, %s", strerror(errno));
+		}
 	}
 
 	setsockopt(server_info->fd, IPPROTO_IP, IP_RECVTTL, &on, sizeof(on));
@@ -1736,6 +1762,13 @@ static int _DNS_client_create_socket_tcp(struct dns_server_info *server_info)
 		goto errout;
 	}
 
+	if (server_info->so_mark >= 0) {
+		unsigned int so_mark = server_info->so_mark;
+		if (setsockopt(fd, SOL_SOCKET, SO_MARK, &so_mark, sizeof(so_mark)) != 0) {
+			tlog(TLOG_DEBUG, "set socket mark failed, %s", strerror(errno));
+		}
+	}
+
 	/* enable tcp fast open */
 	if (setsockopt(fd, IPPROTO_TCP, TCP_FASTOPEN_CONNECT, &yes, sizeof(yes)) != 0) {
 		tlog(TLOG_DEBUG, "enable TCP fast open failed, %s", strerror(errno));
@@ -1749,7 +1782,7 @@ static int _DNS_client_create_socket_tcp(struct dns_server_info *server_info)
 	set_sock_keepalive(fd, 15, 3, 4);
 
 	if (connect(fd, &server_info->addr, server_info->ai_addrlen) != 0) {
-		if (errno == ENETUNREACH) {
+		if (errno == ENETUNREACH || errno == EHOSTUNREACH) {
 			tlog(TLOG_DEBUG, "connect %s failed, %s", server_info->ip, strerror(errno));
 			goto errout;
 		}
@@ -1818,6 +1851,13 @@ static int _DNS_client_create_socket_tls(struct dns_server_info *server_info, ch
 		goto errout;
 	}
 
+	if (server_info->so_mark >= 0) {
+		unsigned int so_mark = server_info->so_mark;
+		if (setsockopt(fd, SOL_SOCKET, SO_MARK, &so_mark, sizeof(so_mark)) != 0) {
+			tlog(TLOG_DEBUG, "set socket mark failed, %s", strerror(errno));
+		}
+	}
+
 	if (setsockopt(fd, IPPROTO_TCP, TCP_FASTOPEN_CONNECT, &yes, sizeof(yes)) != 0) {
 		tlog(TLOG_DEBUG, "enable TCP fast open failed.");
 	}
@@ -1831,7 +1871,7 @@ static int _DNS_client_create_socket_tls(struct dns_server_info *server_info, ch
 	setsockopt(fd, IPPROTO_IP, IP_TOS, &ip_tos, sizeof(ip_tos));
 
 	if (connect(fd, &server_info->addr, server_info->ai_addrlen) != 0) {
-		if (errno == ENETUNREACH) {
+		if (errno == ENETUNREACH || errno == EHOSTUNREACH) {
 			tlog(TLOG_DEBUG, "connect %s failed, %s", server_info->ip, strerror(errno));
 			goto errout;
 		}
@@ -1949,8 +1989,17 @@ static int _dns_client_process_udp(struct dns_server_info *server_info, struct e
 
 	len = recvmsg(server_info->fd, &msg, MSG_DONTWAIT);
 	if (len < 0) {
-		tlog(TLOG_ERROR, "recvfrom failed, %s\n", strerror(errno));
-		return -1;
+		if (errno == EAGAIN || errno == EWOULDBLOCK) {
+			return 0;
+		}
+
+		if (errno == ECONNREFUSED) {
+			tlog(TLOG_DEBUG, "recvfrom %s failed, %s\n", server_info->ip, strerror(errno));
+			goto errout;
+		}
+
+		tlog(TLOG_ERROR, "recvfrom %s failed, %s\n", server_info->ip, strerror(errno));
+		goto errout;
 	}
 	from_len = msg.msg_namelen;
 
@@ -1981,6 +2030,15 @@ static int _dns_client_process_udp(struct dns_server_info *server_info, struct e
 	}
 
 	return 0;
+
+errout:
+	pthread_mutex_lock(&client.server_list_lock);
+	server_info->recv_buff.len = 0;
+	server_info->send_buff.len = 0;
+	_dns_client_close_socket(server_info);
+	pthread_mutex_unlock(&client.server_list_lock);
+
+	return -1;
 }
 
 static int _dns_client_socket_ssl_send(struct dns_server_info *server, const void *buf, int num)
@@ -2250,16 +2308,17 @@ static int _dns_client_process_tcp(struct dns_server_info *server_info, struct e
 		len = _dns_client_socket_recv(server_info);
 		if (len < 0) {
 			/* no data to recv, try again */
-			if (errno == EAGAIN) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
 				return 0;
 			}
 
-			/* FOR GFW */
-			if (errno == ECONNRESET) {
+			if (errno == ECONNRESET || errno == ENETUNREACH || errno == EHOSTUNREACH) {
+				tlog(TLOG_DEBUG, "recv failed, server %s:%d, %s\n", server_info->ip, server_info->port,
+					 strerror(errno));
 				goto errout;
 			}
 
-			if (errno == ETIMEDOUT) {
+			if (errno == ETIMEDOUT || errno == ECONNREFUSED) {
 				tlog(TLOG_INFO, "recv failed, server %s:%d, %s\n", server_info->ip, server_info->port, strerror(errno));
 				goto errout;
 			}
@@ -2651,7 +2710,7 @@ static int _dns_client_send_udp(struct dns_server_info *server_info, void *packe
 		return -1;
 	}
 
-	send_len = sendto(server_info->fd, packet, len, 0, &server_info->addr, server_info->ai_addrlen);
+	send_len = sendto(server_info->fd, packet, len, 0, NULL, 0);
 	if (send_len != len) {
 		return -1;
 	}
@@ -2916,7 +2975,7 @@ static int _dns_client_send_packet(struct dns_query_struct *query, void *packet,
 	}
 
 	if (atomic_read(&query->dns_request_sent) <= 0) {
-		tlog(TLOG_ERROR, "Send query to upstream server failed, total server number %d", total_server);
+		tlog(TLOG_WARN, "Send query to upstream server failed, total server number %d", total_server);
 		return -1;
 	}
 

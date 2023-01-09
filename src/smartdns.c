@@ -270,6 +270,7 @@ static int _smartdns_add_servers(void)
 		flags.type = dns_conf_servers[i].type;
 		flags.server_flag = dns_conf_servers[i].server_flag;
 		flags.result_flag = dns_conf_servers[i].result_flag;
+		flags.set_mark = dns_conf_servers[i].set_mark;
 		ret = dns_client_add_server(dns_conf_servers[i].server, dns_conf_servers[i].port, dns_conf_servers[i].type,
 									&flags);
 		if (ret != 0) {
@@ -361,6 +362,9 @@ static int _smartdns_init(void)
 
 	tlog_setlogscreen(verbose_screen);
 	tlog_setlevel(dns_conf_log_level);
+	if (dns_conf_log_file_mode > 0) {
+		tlog_set_permission(tlog_get_root(), dns_conf_log_file_mode, dns_conf_log_file_mode);
+	}
 
 	tlog(TLOG_NOTICE, "smartdns starting...(Copyright (C) Nick Peng <pymumu@gmail.com>, build: %s %s)", __DATE__,
 		 __TIME__);
