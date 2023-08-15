@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2020 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2023 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -26,10 +26,26 @@
 #include <unistd.h>
 
 static const char *current_conf_file = NULL;
+static int current_conf_lineno = 0;
 
 const char *conf_get_conf_file(void)
 {
 	return current_conf_file;
+}
+
+int conf_get_current_lineno(void)
+{
+	return current_conf_lineno;
+}
+
+static char *get_dir_name(char *path)
+{
+	if (strstr(path, "/") == NULL) {
+		strncpy(path, "./", PATH_MAX);
+		return path;
+	}
+
+	return dirname(path);
 }
 
 const char *conf_get_conf_fullpath(const char *path, char *fullpath, size_t path_len)
@@ -47,7 +63,7 @@ const char *conf_get_conf_fullpath(const char *path, char *fullpath, size_t path
 
 	strncpy(file_path_dir, conf_get_conf_file(), PATH_MAX - 1);
 	file_path_dir[PATH_MAX - 1] = 0;
-	dirname(file_path_dir);
+	get_dir_name(file_path_dir);
 	if (file_path_dir[0] == '\0') {
 		strncpy(fullpath, path, path_len);
 		return fullpath;
@@ -152,6 +168,39 @@ int conf_size(const char *item, void *data, int argc, char *argv[])
 	size_t size = 0;
 	int num = 0;
 	struct config_item_size *item_size = data;
+	char *value = argv[1];
+
+	if (strstr(value, "k") || strstr(value, "K")) {
+		base = 1024;
+	} else if (strstr(value, "m") || strstr(value, "M")) {
+		base = 1024 * 1024;
+	} else if (strstr(value, "g") || strstr(value, "G")) {
+		base = 1024 * 1024 * 1024;
+	}
+
+	num = atoi(value);
+	if (num < 0) {
+		return -1;
+	}
+
+	size = num * base;
+	if (size > item_size->max) {
+		size = item_size->max;
+	} else if (size < item_size->min) {
+		size = item_size->min;
+	}
+
+	*(item_size->data) = size;
+
+	return 0;
+}
+
+int conf_ssize(const char *item, void *data, int argc, char *argv[])
+{
+	int base = 1;
+	ssize_t size = 0;
+	int num = 0;
+	struct config_item_ssize *item_size = data;
 	char *value = argv[1];
 
 	if (strstr(value, "k") || strstr(value, "K")) {
@@ -299,16 +348,22 @@ static int load_conf_printf(const char *file, int lineno, int ret)
 static int load_conf_file(const char *file, struct config_item *items, conf_error_handler handler)
 {
 	FILE *fp = NULL;
-	char line[MAX_LINE_LEN];
+	char line[MAX_LINE_LEN + MAX_KEY_LEN];
 	char key[MAX_KEY_LEN];
 	char value[MAX_LINE_LEN];
 	int filed_num = 0;
 	int i = 0;
+	int last_item_index = -1;
 	int argc = 0;
 	char *argv[1024];
 	int ret = 0;
 	int call_ret = 0;
 	int line_no = 0;
+	int line_len = 0;
+	int read_len = 0;
+	int is_last_line_wrap = 0;
+	int current_line_wrap = 0;
+	const char *last_file = NULL;
 
 	if (handler == NULL) {
 		handler = load_conf_printf;
@@ -320,9 +375,47 @@ static int load_conf_file(const char *file, struct config_item *items, conf_erro
 	}
 
 	line_no = 0;
-	while (fgets(line, MAX_LINE_LEN, fp)) {
+	while (fgets(line + line_len, MAX_LINE_LEN - line_len, fp)) {
+		current_line_wrap = 0;
 		line_no++;
-		filed_num = sscanf(line, "%63s %1023[^\r\n]s", key, value);
+		read_len = strnlen(line + line_len, sizeof(line));
+		if (read_len >= 2 && *(line + line_len + read_len - 2) == '\\') {
+			read_len -= 1;
+			current_line_wrap = 1;
+		}
+
+		/* comment in wrap line, skip */
+		if (is_last_line_wrap && read_len > 0) {
+			if (*(line + line_len) == '#') {
+				continue;
+			}
+		}
+
+		/* trim prefix spaces in wrap line */
+		if ((current_line_wrap == 1 || is_last_line_wrap == 1) && read_len > 0) {
+			is_last_line_wrap = current_line_wrap;
+			read_len -= 1;
+			for (i = 0; i < read_len; i++) {
+				char *ptr = line + line_len + i;
+				if (*ptr == ' ' || *ptr == '\t') {
+					continue;
+				}
+
+				memmove(line + line_len, ptr, read_len - i + 1);
+				line_len += read_len - i;
+				break;
+			}
+
+			line[line_len] = '\0';
+			if (current_line_wrap) {
+				continue;
+			}
+		}
+
+		line_len = 0;
+		is_last_line_wrap = 0;
+
+		filed_num = sscanf(line, "%63s %8191[^\r\n]s", key, value);
 		if (filed_num <= 0) {
 			continue;
 		}
@@ -338,13 +431,21 @@ static int load_conf_file(const char *file, struct config_item *items, conf_erro
 			goto errout;
 		}
 
-		for (i = 0;; i++) {
+		for (i = last_item_index;; i++) {
+			if (i < 0) {
+				continue;
+			}
+
 			if (items[i].item == NULL) {
 				handler(file, line_no, CONF_RET_NOENT);
 				break;
 			}
 
 			if (strncmp(items[i].item, key, MAX_KEY_LEN) != 0) {
+				if (last_item_index >= 0) {
+					i = -1;
+					last_item_index = -1;
+				}
 				continue;
 			}
 
@@ -354,7 +455,9 @@ static int load_conf_file(const char *file, struct config_item *items, conf_erro
 
 			conf_getopt_reset();
 			/* call item function */
+			last_file = current_conf_file;
 			current_conf_file = file;
+			current_conf_lineno = line_no;
 			call_ret = items[i].item_func(items[i].item, items[i].data, argc, argv);
 			ret = handler(file, line_no, call_ret);
 			if (ret != 0) {
@@ -363,7 +466,11 @@ static int load_conf_file(const char *file, struct config_item *items, conf_erro
 			}
 
 			conf_getopt_reset();
+			if (last_file) {
+				current_conf_file = last_file;
+			}
 
+			last_item_index = i;
 			break;
 		}
 	}

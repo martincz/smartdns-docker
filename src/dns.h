@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2020 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2023 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -19,13 +19,19 @@
 #ifndef _DNS_HEAD_H
 #define _DNS_HEAD_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif /*__cplusplus */
+
 #define DNS_RR_A_LEN 4
 #define DNS_RR_AAAA_LEN 16
 #define DNS_MAX_CNAME_LEN 256
 #define DNS_MAX_OPT_LEN 256
 #define DNS_IN_PACKSIZE (512 * 8)
-#define DNS_PACKSIZE (512 * 12)
+#define DNS_PACKSIZE (512 * 16)
 #define DNS_DEFAULT_PACKET_SIZE 512
+#define DNS_MAX_ALPN_LEN 32
+#define DNS_MAX_ECH_LEN 256
 
 #define DNS_ADDR_FAMILY_IP 1
 #define DNS_ADDR_FAMILY_IPV6 2
@@ -81,7 +87,7 @@ typedef enum dns_opt_code {
 } dns_opt_code_t;
 
 /* https://datatracker.ietf.org/doc/draft-ietf-dnsop-svcb-https/11/ */
-typedef enum dns_htts_svcparam {
+typedef enum dns_https_svcparam {
 	DNS_HTTPS_T_MANDATORY = 0,
 	DNS_HTTPS_T_ALPN = 1,
 	DNS_HTTPS_T_NO_DEFAULT_ALPN = 2,
@@ -90,7 +96,7 @@ typedef enum dns_htts_svcparam {
 	DNS_HTTPS_T_ECH = 5,
 	DNS_HTTPS_T_IPV6HINT = 6,
 	DNS_HTTPS_T_ALL = 255
-} dns_htts_svcparam_t;
+} dns_https_svcparam_t;
 
 typedef enum dns_opcode {
 	DNS_OP_QUERY = 0,
@@ -129,7 +135,7 @@ struct dns_head {
 	unsigned short qdcount; /* number of question entries */
 	unsigned short ancount; /* number of answer entries */
 	unsigned short nscount; /* number of authority entries */
-	unsigned short nrcount; /* number of addititional resource entries */
+	unsigned short nrcount; /* number of additional resource entries */
 } __attribute__((packed, aligned(2)));
 
 #define DNS_PACKET_DICT_SIZE 16
@@ -143,7 +149,7 @@ struct dns_packet_dict {
 	struct dns_packet_dict_item names[DNS_PACKET_DICT_SIZE];
 };
 
-/* packet haed */
+/* packet head */
 struct dns_packet {
 	struct dns_head head;
 	unsigned short questions;
@@ -198,7 +204,7 @@ struct dns_opt_ecs {
 	unsigned char addr[DNS_RR_AAAA_LEN];
 } __attribute__((packed));
 
-/* OPT COOLIE */
+/* OPT COOKIE */
 struct dns_opt_cookie {
 	char server_cookie_len;
 	unsigned char client_cookie[8];
@@ -232,7 +238,7 @@ struct dns_rrs *dns_get_rrs_start(struct dns_packet *packet, dns_rr_type type, i
 struct dns_rr_nested *dns_add_rr_nested_start(struct dns_rr_nested *rr_nested_buffer, struct dns_packet *packet,
 											  dns_rr_type type, dns_type_t rtype, const char *domain, int ttl);
 int dns_add_rr_nested_end(struct dns_rr_nested *rr_nested, dns_type_t rtype);
-int dns_add_rr_nested_memcpy(struct dns_rr_nested *rr_nested, void *data, int data_len);
+int dns_add_rr_nested_memcpy(struct dns_rr_nested *rr_nested, const void *data, int data_len);
 
 void *dns_get_rr_nested_start(struct dns_rrs *rrs, char *domain, int maxsize, int *qtype, int *ttl, int *rr_len);
 void *dns_get_rr_nested_next(struct dns_rrs *rrs, void *rr_nested, int rr_nested_len);
@@ -253,8 +259,11 @@ int dns_add_A(struct dns_packet *packet, dns_rr_type type, const char *domain, i
 			  unsigned char addr[DNS_RR_A_LEN]);
 int dns_get_A(struct dns_rrs *rrs, char *domain, int maxsize, int *ttl, unsigned char addr[DNS_RR_A_LEN]);
 
-int dns_add_PTR(struct dns_packet *packet, dns_rr_type type, const char *domain, int ttl, char *cname);
+int dns_add_PTR(struct dns_packet *packet, dns_rr_type type, const char *domain, int ttl, const char *cname);
 int dns_get_PTR(struct dns_rrs *rrs, char *domain, int maxsize, int *ttl, char *cname, int cname_size);
+
+int dns_add_TXT(struct dns_packet *packet, dns_rr_type type, const char *domain, int ttl, const char *text);
+int dns_get_TXT(struct dns_rrs *rrs, char *domain, int maxsize, int *ttl, char *text, int txt_size);
 
 int dns_add_AAAA(struct dns_packet *packet, dns_rr_type type, const char *domain, int ttl,
 				 unsigned char addr[DNS_RR_AAAA_LEN]);
@@ -272,27 +281,31 @@ int dns_get_OPT_payload_size(struct dns_packet *packet);
 int dns_add_OPT_ECS(struct dns_packet *packet, struct dns_opt_ecs *ecs);
 int dns_get_OPT_ECS(struct dns_rrs *rrs, unsigned short *opt_code, unsigned short *opt_len, struct dns_opt_ecs *ecs);
 
-int dns_add_OPT_TCP_KEEYALIVE(struct dns_packet *packet, unsigned short timeout);
-int dns_get_OPT_TCP_KEEYALIVE(struct dns_rrs *rrs, unsigned short *opt_code, unsigned short *opt_len,
+int dns_add_OPT_TCP_KEEPALIVE(struct dns_packet *packet, unsigned short timeout);
+int dns_get_OPT_TCP_KEEPALIVE(struct dns_rrs *rrs, unsigned short *opt_code, unsigned short *opt_len,
 							  unsigned short *timeout);
 
-int dns_add_HTTPS_start(struct dns_rr_nested *svcparam_buffer, struct dns_packet *packet,
-										  dns_rr_type type, const char *domain, int ttl, int priority,
-										  const char *target);
+/* the key must be added in orders, or dig will report FORMERR */
+int dns_add_HTTPS_start(struct dns_rr_nested *svcparam_buffer, struct dns_packet *packet, dns_rr_type type,
+						const char *domain, int ttl, int priority, const char *target);
 int dns_HTTPS_add_raw(struct dns_rr_nested *svcparam, unsigned short key, unsigned char *value, unsigned short len);
-int dns_HTTPS_add_port(struct dns_rr_nested *svcparam, unsigned short port);
-int dns_HTTPS_add_alpn(struct dns_rr_nested *svcparam, const char *alpn);
+/* key 1, alph */
+int dns_HTTPS_add_alpn(struct dns_rr_nested *svcparam, const char *alpn, int alpn_len);
+/* key 2, no default alph */
 int dns_HTTPS_add_no_default_alpn(struct dns_rr_nested *svcparam);
-int dns_HTTPS_add_ipv4hint(struct dns_rr_nested *svcparam, unsigned char addr[][DNS_RR_A_LEN],
-											 int addr_num);
-int dns_HTTPS_add_ipv6hint(struct dns_rr_nested *svcparam, unsigned char addr[][DNS_RR_AAAA_LEN],
-											 int addr_num);
+/* key 3, port */
+int dns_HTTPS_add_port(struct dns_rr_nested *svcparam, unsigned short port);
+/* key 4, ipv4 */
+int dns_HTTPS_add_ipv4hint(struct dns_rr_nested *svcparam, unsigned char *addr[], int addr_num);
+/* key 5, ech */
 int dns_HTTPS_add_ech(struct dns_rr_nested *svcparam, void *ech, int ech_len);
+/* key 6, ipv6*/
+int dns_HTTPS_add_ipv6hint(struct dns_rr_nested *svcparam, unsigned char *addr[], int addr_num);
 int dns_add_HTTPS_end(struct dns_rr_nested *svcparam);
 
-struct dns_https_param *dns_get_HTTPS_svcparm_start(struct dns_rrs *rrs, char *domain, int maxsize, int *ttl,
-													int *priority, char *target, int target_size);
-struct dns_https_param *dns_get_HTTPS_svcparm_next(struct dns_rrs *rrs, struct dns_https_param *parm);
+int dns_get_HTTPS_svcparm_start(struct dns_rrs *rrs, struct dns_https_param **https_param, char *domain, int maxsize,
+								int *ttl, int *priority, char *target, int target_size);
+struct dns_https_param *dns_get_HTTPS_svcparm_next(struct dns_rrs *rrs, struct dns_https_param *param);
 
 /*
  * Packet operation
@@ -310,4 +323,7 @@ struct dns_update_param {
 
 int dns_packet_update(unsigned char *data, int size, struct dns_update_param *param);
 
+#ifdef __cplusplus
+}
+#endif /*__cplusplus */
 #endif

@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2020 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2023 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -26,6 +26,7 @@
 #include "hashtable.h"
 #include "http_parse.h"
 #include "list.h"
+#include "proxy.h"
 #include "tlog.h"
 #include "util.h"
 #include <arpa/inet.h>
@@ -40,26 +41,29 @@
 #include <netinet/ip_icmp.h>
 #include <netinet/tcp.h>
 #include <openssl/err.h>
+#include <openssl/rand.h>
 #include <openssl/ssl.h>
+#include <openssl/x509v3.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 
 #define DNS_MAX_HOSTNAME 256
-#define DNS_MAX_EVENTS 64
+#define DNS_MAX_EVENTS 256
 #define DNS_HOSTNAME_LEN 128
 #define DNS_TCP_BUFFER (32 * 1024)
 #define DNS_TCP_IDLE_TIMEOUT (60 * 10)
 #define DNS_TCP_CONNECT_TIMEOUT (5)
 #define DNS_QUERY_TIMEOUT (500)
 #define DNS_QUERY_RETRY (4)
-#define DNS_PENDING_SERVER_RETRY 40
+#define DNS_PENDING_SERVER_RETRY 60
 #define SOCKET_PRIORITY (6)
 #define SOCKET_IP_TOS (IPTOS_LOWDELAY | IPTOS_RELIABILITY)
 
@@ -91,9 +95,11 @@ struct dns_server_info {
 
 	char ip[DNS_HOSTNAME_LEN];
 	int port;
+	char proxy_name[DNS_HOSTNAME_LEN];
 	/* server type */
 	dns_server_type_t type;
 	long long so_mark;
+	int drop_packet_latency_ms;
 
 	/* client socket */
 	int fd;
@@ -103,6 +109,9 @@ struct dns_server_info {
 	int ssl_write_len;
 	SSL_CTX *ssl_ctx;
 	SSL_SESSION *ssl_session;
+
+	struct proxy_conn *proxy;
+
 	pthread_mutex_t lock;
 	char skip_check_cert;
 	dns_server_status status;
@@ -112,7 +121,9 @@ struct dns_server_info {
 
 	time_t last_send;
 	time_t last_recv;
+	unsigned long send_tick;
 	int prohibit;
+	int is_already_prohibit;
 
 	/* server addr info */
 	unsigned short ai_family;
@@ -125,6 +136,10 @@ struct dns_server_info {
 	};
 
 	struct client_dns_server_flags flags;
+
+	/* ECS */
+	struct dns_client_ecs ecs_ipv4;
+	struct dns_client_ecs ecs_ipv6;
 };
 
 struct dns_server_pending_group {
@@ -146,6 +161,9 @@ struct dns_server_pending {
 	unsigned int has_v6;
 	unsigned int query_v4;
 	unsigned int query_v6;
+	unsigned int has_soa_v4;
+	unsigned int has_soa_v6;
+
 	/* server type */
 	dns_server_type_t type;
 	int retry_cnt;
@@ -186,18 +204,20 @@ struct dns_client {
 
 	/* query list */
 	struct list_head dns_request_list;
-	pthread_cond_t run_cond;
 	atomic_t run_period;
 	atomic_t dns_server_num;
+	atomic_t dns_server_prohibit_num;
 
 	/* ECS */
 	struct dns_client_ecs ecs_ipv4;
 	struct dns_client_ecs ecs_ipv6;
 
-	/* query doman hash table, key: sid + domain */
+	/* query domain hash table, key: sid + domain */
 	pthread_mutex_t domain_map_lock;
 	DECLARE_HASHTABLE(domain_map, 6);
 	DECLARE_HASHTABLE(group, 4);
+
+	int fd_wakeup;
 };
 
 /* dns replied server info */
@@ -249,10 +269,15 @@ struct dns_query_struct {
 };
 
 static struct dns_client client;
-static atomic_t dns_client_sid = ATOMIC_INIT(0);
 static LIST_HEAD(pending_servers);
 static pthread_mutex_t pending_server_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int dns_client_has_bootstrap_dns = 0;
+
+static int _dns_client_send_udp(struct dns_server_info *server_info, void *packet, int len);
+static void _dns_client_clear_wakeup_event(void);
+static void _dns_client_do_wakeup_event(void);
+static int _dns_client_setup_ecs(char *ip, int subnet, struct dns_client_ecs *ecs_ipv4,
+								 struct dns_client_ecs *ecs_ipv6);
 
 static ssize_t _ssl_read(struct dns_server_info *server, void *buff, int num)
 {
@@ -418,8 +443,8 @@ static struct addrinfo *_dns_client_getaddr(const char *host, char *port, int ty
 
 	ret = getaddrinfo(host, port, &hints, &result);
 	if (ret != 0) {
-		tlog(TLOG_ERROR, "get addr info failed. %s\n", gai_strerror(ret));
-		tlog(TLOG_ERROR, "host = %s, port = %s, type = %d, protocol = %d", host, port, type, protocol);
+		tlog(TLOG_WARN, "get addr info failed. %s\n", gai_strerror(ret));
+		tlog(TLOG_WARN, "host = %s, port = %s, type = %d, protocol = %d", host, port, type, protocol);
 		goto errout;
 	}
 
@@ -432,7 +457,8 @@ errout:
 }
 
 /* check whether server exists */
-static int _dns_client_server_exist(const char *server_ip, int port, dns_server_type_t server_type)
+static int _dns_client_server_exist(const char *server_ip, int port, dns_server_type_t server_type,
+									struct client_dns_server_flags *flags)
 {
 	struct dns_server_info *server_info = NULL;
 	struct dns_server_info *tmp = NULL;
@@ -440,6 +466,10 @@ static int _dns_client_server_exist(const char *server_ip, int port, dns_server_
 	list_for_each_entry_safe(server_info, tmp, &client.dns_server_list, list)
 	{
 		if (server_info->port != port || server_info->type != server_type) {
+			continue;
+		}
+
+		if (memcmp(&server_info->flags, flags, sizeof(*flags)) != 0) {
 			continue;
 		}
 
@@ -470,7 +500,8 @@ static void _dns_client_server_update_ttl(struct ping_host_struct *ping_host, co
 }
 
 /* get server control block by ip and port, type */
-static struct dns_server_info *_dns_client_get_server(char *server_ip, int port, dns_server_type_t server_type)
+static struct dns_server_info *_dns_client_get_server(char *server_ip, int port, dns_server_type_t server_type,
+													  struct client_dns_server_flags *flags)
 {
 	struct dns_server_info *server_info = NULL;
 	struct dns_server_info *tmp = NULL;
@@ -488,6 +519,10 @@ static struct dns_server_info *_dns_client_get_server(char *server_ip, int port,
 		}
 
 		if (strncmp(server_info->ip, server_ip, DNS_HOSTNAME_LEN) != 0) {
+			continue;
+		}
+
+		if (memcmp(&server_info->flags, flags, sizeof(*flags)) != 0) {
 			continue;
 		}
 
@@ -532,13 +567,9 @@ static struct dns_server_group *_dns_client_get_dnsserver_group(const char *grou
 
 	if (group == NULL) {
 		group = client.default_group;
-		tlog(TLOG_DEBUG, "send query to group %s", DNS_SERVER_GROUP_DEFAULT);
 	} else {
 		if (list_empty(&group->head)) {
 			group = client.default_group;
-			tlog(TLOG_DEBUG, "send query to group %s", DNS_SERVER_GROUP_DEFAULT);
-		} else {
-			tlog(TLOG_DEBUG, "send query to group %s", group_name);
 		}
 	}
 
@@ -577,7 +608,7 @@ errout:
 }
 
 static int _dns_client_add_to_pending_group(const char *group_name, char *server_ip, int port,
-											dns_server_type_t server_type)
+											dns_server_type_t server_type, struct client_dns_server_flags *flags)
 {
 	struct dns_server_pending *item = NULL;
 	struct dns_server_pending *tmp = NULL;
@@ -591,6 +622,10 @@ static int _dns_client_add_to_pending_group(const char *group_name, char *server
 	pthread_mutex_lock(&pending_server_mutex);
 	list_for_each_entry_safe(item, tmp, &pending_servers, list)
 	{
+		if (memcmp(&item->flags, flags, sizeof(*flags)) != 0) {
+			continue;
+		}
+
 		if (strncmp(item->host, server_ip, DNS_HOSTNAME_LEN) == 0 && item->port == port && item->type == server_type) {
 			pending = item;
 			break;
@@ -625,7 +660,8 @@ errout:
 
 /* add server to group */
 static int _dns_client_add_to_group_pending(const char *group_name, char *server_ip, int port,
-											dns_server_type_t server_type, int ispending)
+											dns_server_type_t server_type, struct client_dns_server_flags *flags,
+											int is_pending)
 {
 	struct dns_server_info *server_info = NULL;
 
@@ -633,21 +669,22 @@ static int _dns_client_add_to_group_pending(const char *group_name, char *server
 		return -1;
 	}
 
-	server_info = _dns_client_get_server(server_ip, port, server_type);
+	server_info = _dns_client_get_server(server_ip, port, server_type, flags);
 	if (server_info == NULL) {
-		if (ispending == 0) {
+		if (is_pending == 0) {
 			tlog(TLOG_ERROR, "add server %s:%d to group %s failed", server_ip, port, group_name);
 			return -1;
 		}
-		return _dns_client_add_to_pending_group(group_name, server_ip, port, server_type);
+		return _dns_client_add_to_pending_group(group_name, server_ip, port, server_type, flags);
 	}
 
 	return _dns_client_add_to_group(group_name, server_info);
 }
 
-int dns_client_add_to_group(const char *group_name, char *server_ip, int port, dns_server_type_t server_type)
+int dns_client_add_to_group(const char *group_name, char *server_ip, int port, dns_server_type_t server_type,
+							struct client_dns_server_flags *flags)
 {
-	return _dns_client_add_to_group_pending(group_name, server_ip, port, server_type, 1);
+	return _dns_client_add_to_group_pending(group_name, server_ip, port, server_type, flags, 1);
 }
 
 /* free group member */
@@ -690,12 +727,13 @@ static int _dns_client_remove_server_from_groups(struct dns_server_info *server_
 	return 0;
 }
 
-int dns_client_remove_from_group(const char *group_name, char *server_ip, int port, dns_server_type_t server_type)
+int dns_client_remove_from_group(const char *group_name, char *server_ip, int port, dns_server_type_t server_type,
+								 struct client_dns_server_flags *flags)
 {
 	struct dns_server_info *server_info = NULL;
 	struct dns_server_group *group = NULL;
 
-	server_info = _dns_client_get_server(server_ip, port, server_type);
+	server_info = _dns_client_get_server(server_ip, port, server_type, flags);
 	if (server_info == NULL) {
 		return -1;
 	}
@@ -957,6 +995,25 @@ errout:
 	return NULL;
 }
 
+static int _dns_client_server_add_ecs(struct dns_server_info *server_info, struct client_dns_server_flags *flags)
+{
+	int ret = 0;
+
+	if (flags == NULL) {
+		return 0;
+	}
+
+	if (flags->ipv4_ecs.enable) {
+		ret = _dns_client_setup_ecs(flags->ipv4_ecs.ip, flags->ipv4_ecs.subnet, &server_info->ecs_ipv4, NULL);
+	}
+
+	if (flags->ipv6_ecs.enable) {
+		ret |= _dns_client_setup_ecs(flags->ipv6_ecs.ip, flags->ipv6_ecs.subnet, NULL, &server_info->ecs_ipv6);
+	}
+
+	return ret;
+}
+
 /* add dns server information */
 static int _dns_client_server_add(char *server_ip, char *server_host, int port, dns_server_type_t server_type,
 								  struct client_dns_server_flags *flags)
@@ -1014,7 +1071,7 @@ static int _dns_client_server_add(char *server_ip, char *server_host, int port, 
 	}
 
 	/* if server exist, return */
-	if (_dns_client_server_exist(server_ip, port, server_type) == 0) {
+	if (_dns_client_server_exist(server_ip, port, server_type, flags) == 0) {
 		return 0;
 	}
 
@@ -1047,13 +1104,20 @@ static int _dns_client_server_add(char *server_ip, char *server_host, int port, 
 	server_info->skip_check_cert = skip_check_cert;
 	server_info->prohibit = 0;
 	server_info->so_mark = flags->set_mark;
+	server_info->drop_packet_latency_ms = flags->drop_packet_latency_ms;
+	safe_strncpy(server_info->proxy_name, flags->proxyname, sizeof(server_info->proxy_name));
 	pthread_mutex_init(&server_info->lock, NULL);
 	memcpy(&server_info->flags, flags, sizeof(server_info->flags));
+
+	if (_dns_client_server_add_ecs(server_info, flags) != 0) {
+		tlog(TLOG_ERROR, "add %s ecs failed.", server_ip);
+		goto errout;
+	}
 
 	/* exclude this server from default group */
 	if ((server_info->flags.server_flag & SERVER_FLAG_EXCLUDE_DEFAULT) == 0) {
 		if (_dns_client_add_to_group(DNS_SERVER_GROUP_DEFAULT, server_info) != 0) {
-			tlog(TLOG_ERROR, "add server to default group failed.");
+			tlog(TLOG_ERROR, "add server %s to default group failed.", server_ip);
 			goto errout;
 		}
 	}
@@ -1141,7 +1205,13 @@ static void _dns_client_close_socket(struct dns_server_info *server_info)
 
 	/* remove fd from epoll */
 	epoll_ctl(client.epoll_fd, EPOLL_CTL_DEL, server_info->fd, NULL);
-	close(server_info->fd);
+
+	if (server_info->proxy) {
+		proxy_conn_free(server_info->proxy);
+		server_info->proxy = NULL;
+	} else {
+		close(server_info->fd);
+	}
 
 	server_info->fd = -1;
 	server_info->status = DNS_SERVER_STATUS_DISCONNECTED;
@@ -1318,9 +1388,8 @@ static int _dns_client_server_pending(char *server_ip, int port, dns_server_type
 	atomic_set(&client.run_period, 1);
 	pthread_mutex_unlock(&pending_server_mutex);
 
-	pthread_mutex_lock(&client.domain_map_lock);
-	pthread_cond_signal(&client.run_cond);
-	pthread_mutex_unlock(&client.domain_map_lock);
+	_dns_client_do_wakeup_event();
+
 	return 0;
 errout:
 	if (pending) {
@@ -1331,21 +1400,39 @@ errout:
 }
 
 static int _dns_client_add_server_pending(char *server_ip, char *server_host, int port, dns_server_type_t server_type,
-										  struct client_dns_server_flags *flags, int ispending)
+										  struct client_dns_server_flags *flags, int is_pending)
 {
 	int ret = 0;
+	struct addrinfo *gai = NULL;
+	char server_ip_tmp[DNS_HOSTNAME_LEN] = {0};
 
 	if (server_type >= DNS_SERVER_TYPE_END) {
 		tlog(TLOG_ERROR, "server type is invalid.");
 		return -1;
 	}
 
-	if (check_is_ipaddr(server_ip) && ispending) {
+	if (check_is_ipaddr(server_ip) && is_pending) {
 		ret = _dns_client_server_pending(server_ip, port, server_type, flags);
 		if (ret == 0) {
 			tlog(TLOG_INFO, "add pending server %s", server_ip);
 			return 0;
 		}
+	} else if (check_is_ipaddr(server_ip) && is_pending == 0) {
+		gai = _dns_client_getaddr(server_ip, 0, SOCK_STREAM, 0);
+		if (gai == NULL) {
+			return -1;
+		}
+
+		if (get_host_by_addr(server_ip_tmp, sizeof(server_ip_tmp), gai->ai_addr) != NULL) {
+			tlog(TLOG_INFO, "resolve %s to %s.", server_ip, server_ip_tmp);
+			server_ip = server_ip_tmp;
+		} else {
+			tlog(TLOG_INFO, "resolve %s failed.", server_ip);
+			freeaddrinfo(gai);
+			return -1;
+		}
+
+		freeaddrinfo(gai);
 	}
 
 	/* add server */
@@ -1377,6 +1464,11 @@ int dns_server_num(void)
 	return atomic_read(&client.dns_server_num);
 }
 
+int dns_server_alive_num(void)
+{
+	return atomic_read(&client.dns_server_num) - atomic_read(&client.dns_server_prohibit_num);
+}
+
 static void _dns_client_query_get(struct dns_query_struct *query)
 {
 	if (atomic_inc_return(&query->refcnt) <= 0) {
@@ -1400,7 +1492,7 @@ static void _dns_client_query_release(struct dns_query_struct *query)
 
 	/* notify caller query end */
 	if (query->callback) {
-		tlog(TLOG_DEBUG, "result: %s, qtype: %d, hasresult: %d, id %d", query->domain, query->qtype, query->has_result,
+		tlog(TLOG_DEBUG, "result: %s, qtype: %d, has-result: %d, id %d", query->domain, query->qtype, query->has_result,
 			 query->sid);
 		query->callback(query->domain, DNS_QUERY_END, NULL, NULL, NULL, 0, query->user_ptr);
 	}
@@ -1495,7 +1587,7 @@ static void _dns_client_check_tcp(void)
 		}
 
 		if (server_info->status == DNS_SERVER_STATUS_CONNECTING) {
-			if (server_info->last_send + DNS_TCP_CONNECT_TIMEOUT < now) {
+			if (server_info->last_recv + DNS_TCP_CONNECT_TIMEOUT < now) {
 				tlog(TLOG_DEBUG, "server %s connect timeout.", server_info->ip);
 				_dns_client_close_socket(server_info);
 			}
@@ -1511,7 +1603,7 @@ static void _dns_client_check_tcp(void)
 	pthread_mutex_unlock(&client.server_list_lock);
 }
 
-static struct dns_query_struct *_dns_client_get_request(unsigned short sid, char *domain)
+static struct dns_query_struct *_dns_client_get_request(char *domain, int qtype, unsigned short sid)
 {
 	struct dns_query_struct *query = NULL;
 	struct dns_query_struct *query_result = NULL;
@@ -1521,10 +1613,15 @@ static struct dns_query_struct *_dns_client_get_request(unsigned short sid, char
 	/* get query by hash key : id + domain */
 	key = hash_string(domain);
 	key = jhash(&sid, sizeof(sid), key);
+	key = jhash(&qtype, sizeof(qtype), key);
 	pthread_mutex_lock(&client.domain_map_lock);
 	hash_for_each_possible_safe(client.domain_map, query, tmp, domain_node, key)
 	{
 		if (sid != query->sid) {
+			continue;
+		}
+
+		if (qtype != query->qtype) {
 			continue;
 		}
 
@@ -1578,9 +1675,10 @@ static int _dns_client_recv(struct dns_server_info *server_info, unsigned char *
 {
 	int len = 0;
 	int i = 0;
+	int j = 0;
 	int qtype = 0;
 	int qclass = 0;
-	char domain[DNS_MAX_CNAME_LEN];
+	char domain[DNS_MAX_CNAME_LEN] = {0};
 	int rr_count = 0;
 	struct dns_rrs *rrs = NULL;
 	unsigned char packet_buff[DNS_PACKSIZE];
@@ -1597,7 +1695,7 @@ static int _dns_client_recv(struct dns_server_info *server_info, unsigned char *
 	if (len != 0) {
 		char host_name[DNS_MAX_CNAME_LEN];
 		tlog(TLOG_INFO, "decode failed, packet len = %d, tc = %d, id = %d, from = %s\n", inpacket_len, packet->head.tc,
-			 packet->head.id, gethost_by_addr(host_name, sizeof(host_name), from));
+			 packet->head.id, get_host_by_addr(host_name, sizeof(host_name), from));
 		if (dns_save_fail_packet) {
 			dns_packet_save(dns_save_fail_packet_dir, "client", host_name, inpacket, inpacket_len);
 		}
@@ -1618,10 +1716,13 @@ static int _dns_client_recv(struct dns_server_info *server_info, unsigned char *
 		 dns_get_OPT_payload_size(packet));
 
 	/* get question */
-	rrs = dns_get_rrs_start(packet, DNS_RRS_QD, &rr_count);
-	for (i = 0; i < rr_count && rrs; i++, rrs = dns_get_rrs_next(packet, rrs)) {
-		dns_get_domain(rrs, domain, DNS_MAX_CNAME_LEN, &qtype, &qclass);
-		tlog(TLOG_DEBUG, "domain: %s qtype: %d  qclass: %d\n", domain, qtype, qclass);
+	for (j = 0; j < DNS_RRS_END && domain[0] == '\0'; j++) {
+		rrs = dns_get_rrs_start(packet, (dns_rr_type)j, &rr_count);
+		for (i = 0; i < rr_count && rrs; i++, rrs = dns_get_rrs_next(packet, rrs)) {
+			dns_get_domain(rrs, domain, DNS_MAX_CNAME_LEN, &qtype, &qclass);
+			tlog(TLOG_DEBUG, "domain: %s qtype: %d  qclass: %d\n", domain, qtype, qclass);
+			break;
+		}
 	}
 
 	if (dns_get_OPT_payload_size(packet) > 0) {
@@ -1629,7 +1730,7 @@ static int _dns_client_recv(struct dns_server_info *server_info, unsigned char *
 	}
 
 	/* get query reference */
-	query = _dns_client_get_request(packet->head.id, domain);
+	query = _dns_client_get_request(domain, qtype, packet->head.id);
 	if (query == NULL) {
 		return 0;
 	}
@@ -1670,6 +1771,64 @@ static int _dns_client_recv(struct dns_server_info *server_info, unsigned char *
 	return 0;
 }
 
+static int _dns_client_create_socket_udp_proxy(struct dns_server_info *server_info)
+{
+	struct proxy_conn *proxy = NULL;
+	int fd = -1;
+	struct epoll_event event;
+	int ret = -1;
+
+	proxy = proxy_conn_new(server_info->proxy_name, server_info->ip, server_info->port, 1);
+	if (proxy == NULL) {
+		tlog(TLOG_ERROR, "create proxy failed, %s, proxy: %s", server_info->ip, server_info->proxy_name);
+		goto errout;
+	}
+
+	fd = proxy_conn_get_fd(proxy);
+	if (fd < 0) {
+		tlog(TLOG_ERROR, "get proxy fd failed, %s", server_info->ip);
+		goto errout;
+	}
+
+	if (server_info->so_mark >= 0) {
+		unsigned int so_mark = server_info->so_mark;
+		if (setsockopt(fd, SOL_SOCKET, SO_MARK, &so_mark, sizeof(so_mark)) != 0) {
+			tlog(TLOG_DEBUG, "set socket mark failed, %s", strerror(errno));
+		}
+	}
+
+	set_fd_nonblock(fd, 1);
+	set_sock_keepalive(fd, 15, 3, 4);
+
+	ret = proxy_conn_connect(proxy);
+	if (ret != 0) {
+		if (errno != EINPROGRESS) {
+			tlog(TLOG_DEBUG, "connect %s failed, %s", server_info->ip, strerror(errno));
+			goto errout;
+		}
+	}
+
+	server_info->fd = fd;
+	server_info->status = DNS_SERVER_STATUS_CONNECTING;
+	server_info->proxy = proxy;
+
+	memset(&event, 0, sizeof(event));
+	event.events = EPOLLIN | EPOLLOUT;
+	event.data.ptr = server_info;
+	if (epoll_ctl(client.epoll_fd, EPOLL_CTL_ADD, fd, &event) != 0) {
+		tlog(TLOG_ERROR, "epoll ctl failed, %s", strerror(errno));
+		return -1;
+	}
+
+	return 0;
+errout:
+	if (proxy) {
+		proxy_conn_free(proxy);
+	}
+
+	return -1;
+}
+
 static int _dns_client_create_socket_udp(struct dns_server_info *server_info)
 {
 	int fd = 0;
@@ -1678,6 +1837,10 @@ static int _dns_client_create_socket_udp(struct dns_server_info *server_info)
 	const int val = 255;
 	const int priority = SOCKET_PRIORITY;
 	const int ip_tos = SOCKET_IP_TOS;
+
+	if (server_info->proxy_name[0] != '\0') {
+		return _dns_client_create_socket_udp_proxy(server_info);
+	}
 
 	fd = socket(server_info->ai_family, SOCK_DGRAM, 0);
 	if (fd < 0) {
@@ -1694,13 +1857,8 @@ static int _dns_client_create_socket_udp(struct dns_server_info *server_info)
 	server_info->status = DNS_SERVER_STATUS_CONNECTIONLESS;
 
 	if (connect(fd, &server_info->addr, server_info->ai_addrlen) != 0) {
-		if (errno == ENETUNREACH || errno == EHOSTUNREACH || errno == ECONNREFUSED) {
-			tlog(TLOG_WARN, "connect %s failed, %s", server_info->ip, strerror(errno));
-			goto errout;
-		}
-
 		if (errno != EINPROGRESS) {
-			tlog(TLOG_ERROR, "connect %s failed, %s", server_info->ip, strerror(errno));
+			tlog(TLOG_DEBUG, "connect %s failed, %s", server_info->ip, strerror(errno));
 			goto errout;
 		}
 	}
@@ -1725,7 +1883,7 @@ static int _dns_client_create_socket_udp(struct dns_server_info *server_info)
 	setsockopt(server_info->fd, SOL_SOCKET, SO_PRIORITY, &priority, sizeof(priority));
 	setsockopt(server_info->fd, IPPROTO_IP, IP_TOS, &ip_tos, sizeof(ip_tos));
 	if (server_info->ai_family == AF_INET6) {
-		/* for recving ip ttl value */
+		/* for receiving ip ttl value */
 		setsockopt(server_info->fd, IPPROTO_IPV6, IPV6_RECVHOPLIMIT, &on, sizeof(on));
 		setsockopt(server_info->fd, IPPROTO_IPV6, IPV6_2292HOPLIMIT, &on, sizeof(on));
 		setsockopt(server_info->fd, IPPROTO_IPV6, IPV6_HOPLIMIT, &on, sizeof(on));
@@ -1750,8 +1908,20 @@ static int _DNS_client_create_socket_tcp(struct dns_server_info *server_info)
 	int yes = 1;
 	const int priority = SOCKET_PRIORITY;
 	const int ip_tos = SOCKET_IP_TOS;
+	struct proxy_conn *proxy = NULL;
+	int ret = 0;
 
-	fd = socket(server_info->ai_family, SOCK_STREAM, 0);
+	if (server_info->proxy_name[0] != '\0') {
+		proxy = proxy_conn_new(server_info->proxy_name, server_info->ip, server_info->port, 0);
+		if (proxy == NULL) {
+			tlog(TLOG_ERROR, "create proxy failed, %s, proxy: %s", server_info->ip, server_info->proxy_name);
+			goto errout;
+		}
+		fd = proxy_conn_get_fd(proxy);
+	} else {
+		fd = socket(server_info->ai_family, SOCK_STREAM, 0);
+	}
+
 	if (fd < 0) {
 		tlog(TLOG_ERROR, "create socket failed, %s", strerror(errno));
 		goto errout;
@@ -1781,20 +1951,22 @@ static int _DNS_client_create_socket_tcp(struct dns_server_info *server_info)
 	setsockopt(fd, IPPROTO_TCP, TCP_THIN_LINEAR_TIMEOUTS, &yes, sizeof(yes));
 	set_sock_keepalive(fd, 15, 3, 4);
 
-	if (connect(fd, &server_info->addr, server_info->ai_addrlen) != 0) {
-		if (errno == ENETUNREACH || errno == EHOSTUNREACH) {
-			tlog(TLOG_DEBUG, "connect %s failed, %s", server_info->ip, strerror(errno));
-			goto errout;
-		}
+	if (proxy) {
+		ret = proxy_conn_connect(proxy);
+	} else {
+		ret = connect(fd, &server_info->addr, server_info->ai_addrlen);
+	}
 
+	if (ret != 0) {
 		if (errno != EINPROGRESS) {
-			tlog(TLOG_ERROR, "connect %s failed, %s", server_info->ip, strerror(errno));
+			tlog(TLOG_DEBUG, "connect %s failed, %s", server_info->ip, strerror(errno));
 			goto errout;
 		}
 	}
 
 	server_info->fd = fd;
 	server_info->status = DNS_SERVER_STATUS_CONNECTING;
+	server_info->proxy = proxy;
 
 	memset(&event, 0, sizeof(event));
 	event.events = EPOLLIN | EPOLLOUT;
@@ -1814,9 +1986,14 @@ errout:
 
 	server_info->status = DNS_SERVER_STATUS_INIT;
 
-	if (fd > 0) {
+	if (fd > 0 && proxy == NULL) {
 		close(fd);
 	}
+
+	if (proxy) {
+		proxy_conn_free(proxy);
+	}
+
 	return -1;
 }
 
@@ -1825,13 +2002,27 @@ static int _DNS_client_create_socket_tls(struct dns_server_info *server_info, ch
 	int fd = 0;
 	struct epoll_event event;
 	SSL *ssl = NULL;
+	struct proxy_conn *proxy = NULL;
+
 	int yes = 1;
 	const int priority = SOCKET_PRIORITY;
 	const int ip_tos = SOCKET_IP_TOS;
+	int ret = -1;
 
 	if (server_info->ssl_ctx == NULL) {
 		tlog(TLOG_ERROR, "create ssl ctx failed, %s", server_info->ip);
 		goto errout;
+	}
+
+	if (server_info->proxy_name[0] != '\0') {
+		proxy = proxy_conn_new(server_info->proxy_name, server_info->ip, server_info->port, 0);
+		if (proxy == NULL) {
+			tlog(TLOG_ERROR, "create proxy failed, %s, proxy: %s", server_info->ip, server_info->proxy_name);
+			goto errout;
+		}
+		fd = proxy_conn_get_fd(proxy);
+	} else {
+		fd = socket(server_info->ai_family, SOCK_STREAM, 0);
 	}
 
 	ssl = SSL_new(server_info->ssl_ctx);
@@ -1840,7 +2031,6 @@ static int _DNS_client_create_socket_tls(struct dns_server_info *server_info, ch
 		goto errout;
 	}
 
-	fd = socket(server_info->ai_family, SOCK_STREAM, 0);
 	if (fd < 0) {
 		tlog(TLOG_ERROR, "create socket failed, %s", strerror(errno));
 		goto errout;
@@ -1870,14 +2060,15 @@ static int _DNS_client_create_socket_tls(struct dns_server_info *server_info, ch
 	setsockopt(fd, SOL_SOCKET, SO_PRIORITY, &priority, sizeof(priority));
 	setsockopt(fd, IPPROTO_IP, IP_TOS, &ip_tos, sizeof(ip_tos));
 
-	if (connect(fd, &server_info->addr, server_info->ai_addrlen) != 0) {
-		if (errno == ENETUNREACH || errno == EHOSTUNREACH) {
-			tlog(TLOG_DEBUG, "connect %s failed, %s", server_info->ip, strerror(errno));
-			goto errout;
-		}
+	if (proxy) {
+		ret = proxy_conn_connect(proxy);
+	} else {
+		ret = connect(fd, &server_info->addr, server_info->ai_addrlen);
+	}
 
+	if (ret != 0) {
 		if (errno != EINPROGRESS) {
-			tlog(TLOG_ERROR, "connect %s failed, %s", server_info->ip, strerror(errno));
+			tlog(TLOG_DEBUG, "connect %s failed, %s", server_info->ip, strerror(errno));
 			goto errout;
 		}
 	}
@@ -1902,6 +2093,7 @@ static int _DNS_client_create_socket_tls(struct dns_server_info *server_info, ch
 	server_info->ssl = ssl;
 	server_info->ssl_write_len = -1;
 	server_info->status = DNS_SERVER_STATUS_CONNECTING;
+	server_info->proxy = proxy;
 
 	memset(&event, 0, sizeof(event));
 	event.events = EPOLLIN | EPOLLOUT;
@@ -1925,12 +2117,16 @@ errout:
 
 	server_info->status = DNS_SERVER_STATUS_INIT;
 
-	if (fd > 0) {
+	if (fd > 0 && proxy == NULL) {
 		close(fd);
 	}
 
 	if (ssl) {
 		SSL_free(ssl);
+	}
+
+	if (proxy) {
+		proxy_conn_free(proxy);
 	}
 
 	return -1;
@@ -1964,6 +2160,109 @@ static int _dns_client_create_socket(struct dns_server_info *server_info)
 	return 0;
 }
 
+static int _dns_client_process_send_udp_buffer(struct dns_server_info *server_info, struct epoll_event *event,
+											   unsigned long now)
+{
+	int send_len = 0;
+	if (server_info->send_buff.len <= 0 || server_info->status != DNS_SERVER_STATUS_CONNECTED) {
+		return 0;
+	}
+
+	while (server_info->send_buff.len - send_len > 0) {
+		int ret = 0;
+		int packet_len = 0;
+		packet_len = *(int *)(server_info->send_buff.data + send_len);
+		send_len += sizeof(packet_len);
+		if (packet_len > server_info->send_buff.len - 1) {
+			goto errout;
+		}
+
+		ret = _dns_client_send_udp(server_info, server_info->send_buff.data + send_len, packet_len);
+		if (ret < 0) {
+			tlog(TLOG_ERROR, "sendto failed, %s", strerror(errno));
+			goto errout;
+		}
+		send_len += packet_len;
+	}
+
+	server_info->send_buff.len -= send_len;
+	if (server_info->send_buff.len < 0) {
+		server_info->send_buff.len = 0;
+	}
+
+	return 0;
+
+errout:
+	pthread_mutex_lock(&client.server_list_lock);
+	server_info->recv_buff.len = 0;
+	server_info->send_buff.len = 0;
+	_dns_client_close_socket(server_info);
+	pthread_mutex_unlock(&client.server_list_lock);
+	return -1;
+}
+
+static int _dns_client_process_udp_proxy(struct dns_server_info *server_info, struct epoll_event *event,
+										 unsigned long now)
+{
+	struct sockaddr_storage from;
+	socklen_t from_len = sizeof(from);
+	char from_host[DNS_MAX_CNAME_LEN];
+	unsigned char inpacket[DNS_IN_PACKSIZE];
+	int len = 0;
+	int ret = 0;
+
+	_dns_client_process_send_udp_buffer(server_info, event, now);
+
+	if (!(event->events & EPOLLIN)) {
+		return 0;
+	}
+
+	len = proxy_conn_recvfrom(server_info->proxy, inpacket, sizeof(inpacket), 0, (struct sockaddr *)&from, &from_len);
+	if (len < 0) {
+		tlog(TLOG_ERROR, "recvfrom failed, %s\n", strerror(errno));
+		goto errout;
+	} else if (len == 0) {
+		pthread_mutex_lock(&client.server_list_lock);
+		_dns_client_close_socket(server_info);
+		server_info->recv_buff.len = 0;
+		if (server_info->send_buff.len > 0) {
+			/* still remain request data, reconnect and send*/
+			ret = _dns_client_create_socket(server_info);
+		} else {
+			ret = 0;
+		}
+		pthread_mutex_unlock(&client.server_list_lock);
+		tlog(TLOG_DEBUG, "peer close, %s", server_info->ip);
+		return ret;
+	}
+
+	int latency = get_tick_count() - server_info->send_tick;
+	tlog(TLOG_DEBUG, "recv udp packet from %s, len: %d, latency: %d",
+		 get_host_by_addr(from_host, sizeof(from_host), (struct sockaddr *)&from), len, latency);
+
+	if (latency < server_info->drop_packet_latency_ms) {
+		tlog(TLOG_DEBUG, "drop packet from %s, latency: %d", from_host, latency);
+		return 0;
+	}
+
+	/* update recv time */
+	time(&server_info->last_recv);
+
+	/* processing dns packet */
+	if (_dns_client_recv(server_info, inpacket, len, (struct sockaddr *)&from, from_len) != 0) {
+		return -1;
+	}
+
+	return 0;
+errout:
+	pthread_mutex_lock(&client.server_list_lock);
+	server_info->recv_buff.len = 0;
+	server_info->send_buff.len = 0;
+	_dns_client_close_socket(server_info);
+	pthread_mutex_unlock(&client.server_list_lock);
+	return -1;
+}
+
 static int _dns_client_process_udp(struct dns_server_info *server_info, struct epoll_event *event, unsigned long now)
 {
 	int len = 0;
@@ -1976,6 +2275,10 @@ static int _dns_client_process_udp(struct dns_server_info *server_info, struct e
 	char ans_data[4096];
 	int ttl = 0;
 	struct cmsghdr *cmsg = NULL;
+
+	if (server_info->proxy) {
+		return _dns_client_process_udp_proxy(server_info, event, now);
+	}
 
 	memset(&msg, 0, sizeof(msg));
 	iov.iov_base = (char *)inpacket;
@@ -1993,7 +2296,7 @@ static int _dns_client_process_udp(struct dns_server_info *server_info, struct e
 			return 0;
 		}
 
-		if (errno == ECONNREFUSED) {
+		if (errno == ECONNREFUSED || errno == ENETUNREACH || errno == EHOSTUNREACH) {
 			tlog(TLOG_DEBUG, "recvfrom %s failed, %s\n", server_info->ip, strerror(errno));
 			goto errout;
 		}
@@ -2018,11 +2321,17 @@ static int _dns_client_process_udp(struct dns_server_info *server_info, struct e
 		}
 	}
 
-	tlog(TLOG_DEBUG, "recv udp packet from %s, len: %d, ttl: %d",
-		 gethost_by_addr(from_host, sizeof(from_host), (struct sockaddr *)&from), len, ttl);
+	int latency = get_tick_count() - server_info->send_tick;
+	tlog(TLOG_DEBUG, "recv udp packet from %s, len: %d, ttl: %d, latency: %d",
+		 get_host_by_addr(from_host, sizeof(from_host), (struct sockaddr *)&from), len, ttl, latency);
 
 	/* update recv time */
 	time(&server_info->last_recv);
+
+	if (latency < server_info->drop_packet_latency_ms) {
+		tlog(TLOG_DEBUG, "drop packet from %s, latency: %d", from_host, latency);
+		return 0;
+	}
 
 	/* processing dns packet */
 	if (_dns_client_recv(server_info, inpacket, len, (struct sockaddr *)&from, from_len) != 0) {
@@ -2253,7 +2562,7 @@ static int _dns_client_process_tcp_buff(struct dns_server_info *server_info)
 			}
 
 			if (len > server_info->recv_buff.len - 2) {
-				/* len is not expceded, wait and recv */
+				/* len is not expected, wait and recv */
 				ret = 0;
 				goto out;
 			}
@@ -2389,7 +2698,7 @@ static int _dns_client_process_tcp(struct dns_server_info *server_info, struct e
 			return 0;
 		}
 
-		/* clear epllout event */
+		/* clear epollout event */
 		struct epoll_event mod_event;
 		memset(&mod_event, 0, sizeof(mod_event));
 		mod_event.events = EPOLLIN;
@@ -2471,6 +2780,61 @@ errout:
 	return -1;
 }
 
+static int _dns_client_verify_common_name(struct dns_server_info *server_info, X509 *cert, char *peer_CN)
+{
+	char *tls_host_verify = NULL;
+	GENERAL_NAMES *alt_names = NULL;
+	int i = 0;
+
+	/* check tls host */
+	tls_host_verify = _dns_client_server_get_tls_host_verify(server_info);
+	if (tls_host_verify == NULL) {
+		return 0;
+	}
+
+	if (tls_host_verify) {
+		if (_dns_client_tls_matchName(tls_host_verify, peer_CN, strnlen(peer_CN, DNS_MAX_CNAME_LEN)) == 0) {
+			return 0;
+		}
+	}
+
+	alt_names = X509_get_ext_d2i(cert, NID_subject_alt_name, NULL, NULL);
+	if (alt_names == NULL) {
+		goto errout;
+	}
+
+	/* found subject alt name */
+	for (i = 0; i < sk_GENERAL_NAME_num(alt_names); i++) {
+		GENERAL_NAME *name = sk_GENERAL_NAME_value(alt_names, i);
+		if (name == NULL) {
+			continue;
+		}
+		switch (name->type) {
+		case GEN_DNS: {
+			ASN1_IA5STRING *dns = name->d.dNSName;
+			if (dns == NULL) {
+				continue;
+			}
+
+			tlog(TLOG_DEBUG, "peer SAN: %s", dns->data);
+			if (_dns_client_tls_matchName(tls_host_verify, (char *)dns->data, dns->length) == 0) {
+				tlog(TLOG_DEBUG, "peer SAN match: %s", dns->data);
+				return 0;
+			}
+		} break;
+		case GEN_IPADD:
+			break;
+		default:
+			break;
+		}
+	}
+
+errout:
+	tlog(TLOG_WARN, "server %s CN is invalid, peer CN: %s, expect CN: %s", server_info->ip, peer_CN, tls_host_verify);
+	server_info->prohibit = 1;
+	return -1;
+}
+
 static int _dns_client_tls_verify(struct dns_server_info *server_info)
 {
 	X509 *cert = NULL;
@@ -2484,7 +2848,7 @@ static int _dns_client_tls_verify(struct dns_server_info *server_info)
 	unsigned char *key_sha256 = NULL;
 	char *spki = NULL;
 	int spki_len = 0;
-	char *tls_host_verify = NULL;
+
 	if (server_info->ssl == NULL) {
 		return -1;
 	}
@@ -2503,7 +2867,8 @@ static int _dns_client_tls_verify(struct dns_server_info *server_info)
 			pthread_mutex_unlock(&server_info->lock);
 			peer_CN[0] = '\0';
 			_dns_client_tls_get_cert_CN(cert, peer_CN, sizeof(peer_CN));
-			tlog(TLOG_WARN, "peer server %s certificate verify failed, ret = %ld", server_info->ip, res);
+			tlog(TLOG_WARN, "peer server %s certificate verify failed, %s", server_info->ip,
+				 X509_verify_cert_error_string(res));
 			tlog(TLOG_WARN, "peer CN: %s", peer_CN);
 			goto errout;
 		}
@@ -2516,14 +2881,9 @@ static int _dns_client_tls_verify(struct dns_server_info *server_info)
 	}
 
 	tlog(TLOG_DEBUG, "peer CN: %s", peer_CN);
-	/* check tls host */
-	tls_host_verify = _dns_client_server_get_tls_host_verify(server_info);
-	if (tls_host_verify) {
-		if (_dns_client_tls_matchName(tls_host_verify, peer_CN, strnlen(peer_CN, DNS_MAX_CNAME_LEN)) != 0) {
-			tlog(TLOG_INFO, "server %s CN is invalid, peer CN: %s, expect CN: %s", server_info->ip, peer_CN,
-				 tls_host_verify);
-			goto errout;
-		}
+
+	if (_dns_client_verify_common_name(server_info, cert, peer_CN) != 0) {
+		goto errout;
 	}
 
 	pubkey = X509_get_X509_PUBKEY(cert);
@@ -2609,9 +2969,7 @@ static int _dns_client_process_tls(struct dns_server_info *server_info, struct e
 	if (server_info->status == DNS_SERVER_STATUS_CONNECTING) {
 		/* do SSL hand shake */
 		ret = _ssl_do_handshake(server_info);
-		if (ret == 0) {
-			goto errout;
-		} else if (ret < 0) {
+		if (ret <= 0) {
 			memset(&fd_event, 0, sizeof(fd_event));
 			ssl_ret = _ssl_get_error(server_info, ret);
 			if (ssl_ret == SSL_ERROR_WANT_READ) {
@@ -2685,8 +3043,82 @@ errout:
 	return -1;
 }
 
+static int _dns_proxy_handshake(struct dns_server_info *server_info, struct epoll_event *event, unsigned long now)
+{
+	struct epoll_event fd_event;
+	proxy_handshake_state ret = proxy_conn_handshake(server_info->proxy);
+	int fd = server_info->fd;
+	int retval = -1;
+	int epoll_op = EPOLL_CTL_MOD;
+
+	if (ret == PROXY_HANDSHAKE_OK) {
+		return 0;
+	}
+
+	if (ret == PROXY_HANDSHAKE_ERR) {
+		goto errout;
+	}
+
+	memset(&fd_event, 0, sizeof(fd_event));
+	if (ret == PROXY_HANDSHAKE_CONNECTED) {
+		fd_event.events = EPOLLIN;
+		if (server_info->type == DNS_SERVER_UDP) {
+			server_info->status = DNS_SERVER_STATUS_CONNECTED;
+			epoll_ctl(client.epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+			event->events = 0;
+			fd = proxy_conn_get_udpfd(server_info->proxy);
+			if (fd < 0) {
+				tlog(TLOG_ERROR, "get udp fd failed");
+				goto errout;
+			}
+
+			set_fd_nonblock(fd, 1);
+			if (server_info->so_mark >= 0) {
+				unsigned int so_mark = server_info->so_mark;
+				if (setsockopt(fd, SOL_SOCKET, SO_MARK, &so_mark, sizeof(so_mark)) != 0) {
+					tlog(TLOG_DEBUG, "set socket mark failed, %s", strerror(errno));
+				}
+			}
+			server_info->fd = fd;
+			epoll_op = EPOLL_CTL_ADD;
+		} else {
+			fd_event.events |= EPOLLOUT;
+		}
+		retval = 0;
+	}
+
+	if (ret == PROXY_HANDSHAKE_WANT_READ) {
+		fd_event.events = EPOLLIN;
+	} else if (ret == PROXY_HANDSHAKE_WANT_WRITE) {
+		fd_event.events = EPOLLOUT | EPOLLIN;
+	}
+
+	fd_event.data.ptr = server_info;
+	if (epoll_ctl(client.epoll_fd, epoll_op, fd, &fd_event) != 0) {
+		tlog(TLOG_ERROR, "epoll ctl failed, %s", strerror(errno));
+		goto errout;
+	}
+
+	return retval;
+
+errout:
+	pthread_mutex_lock(&client.server_list_lock);
+	server_info->recv_buff.len = 0;
+	server_info->send_buff.len = 0;
+	_dns_client_close_socket(server_info);
+	pthread_mutex_unlock(&client.server_list_lock);
+	return -1;
+}
+
 static int _dns_client_process(struct dns_server_info *server_info, struct epoll_event *event, unsigned long now)
 {
+	if (server_info->proxy) {
+		int ret = _dns_proxy_handshake(server_info, event, now);
+		if (ret != 0) {
+			return ret;
+		}
+	}
+
 	if (server_info->type == DNS_SERVER_UDP) {
 		/* receive from udp */
 		return _dns_client_process_udp(server_info, event, now);
@@ -2694,7 +3126,7 @@ static int _dns_client_process(struct dns_server_info *server_info, struct epoll
 		/* receive from tcp */
 		return _dns_client_process_tcp(server_info, event, now);
 	} else if (server_info->type == DNS_SERVER_TLS || server_info->type == DNS_SERVER_HTTPS) {
-		/* recive from tls */
+		/* receive from tls */
 		return _dns_client_process_tls(server_info, event, now);
 	} else {
 		return -1;
@@ -2703,19 +3135,68 @@ static int _dns_client_process(struct dns_server_info *server_info, struct epoll
 	return 0;
 }
 
+static int _dns_client_copy_data_to_buffer(struct dns_server_info *server_info, void *packet, int len)
+{
+	if (DNS_TCP_BUFFER - server_info->send_buff.len < len) {
+		errno = ENOMEM;
+		return -1;
+	}
+
+	memcpy(server_info->send_buff.data + server_info->send_buff.len, packet, len);
+	server_info->send_buff.len += len;
+
+	return 0;
+}
+
 static int _dns_client_send_udp(struct dns_server_info *server_info, void *packet, int len)
 {
 	int send_len = 0;
+	const struct sockaddr *addr = &server_info->addr;
+	socklen_t addrlen = server_info->ai_addrlen;
+	int ret = 0;
+
 	if (server_info->fd <= 0) {
 		return -1;
 	}
 
+	if (server_info->proxy) {
+		if (server_info->status != DNS_SERVER_STATUS_CONNECTED) {
+			/*set packet len*/
+			_dns_client_copy_data_to_buffer(server_info, &len, sizeof(len));
+			return _dns_client_copy_data_to_buffer(server_info, packet, len);
+		}
+
+		send_len = proxy_conn_sendto(server_info->proxy, packet, len, 0, addr, addrlen);
+		if (send_len != len) {
+			_dns_client_close_socket(server_info);
+			server_info->recv_buff.len = 0;
+			if (server_info->send_buff.len > 0) {
+				/* still remain request data, reconnect and send*/
+				ret = _dns_client_create_socket(server_info);
+			} else {
+				ret = 0;
+			}
+
+			if (ret != 0) {
+				return -1;
+			}
+
+			_dns_client_copy_data_to_buffer(server_info, &len, sizeof(len));
+			return _dns_client_copy_data_to_buffer(server_info, packet, len);
+		}
+
+		return 0;
+	}
+
 	send_len = sendto(server_info->fd, packet, len, 0, NULL, 0);
 	if (send_len != len) {
-		return -1;
+		goto errout;
 	}
 
 	return 0;
+
+errout:
+	return -1;
 }
 
 static int _dns_client_send_data_to_buffer(struct dns_server_info *server_info, void *packet, int len)
@@ -2879,6 +3360,92 @@ static int _dns_client_send_https(struct dns_server_info *server_info, void *pac
 	return 0;
 }
 
+static int _dns_client_setup_server_packet(struct dns_server_info *server_info, struct dns_query_struct *query,
+										   void *default_packet, int default_packet_len,
+										   unsigned char *packet_data_buffer, void **packet_data, int *packet_data_len)
+{
+	unsigned char packet_buff[DNS_PACKSIZE];
+	struct dns_packet *packet = (struct dns_packet *)packet_buff;
+	struct dns_head head;
+	int encode_len = 0;
+	int repack = 0;
+	int hitchhiking = 0;
+
+	*packet_data = default_packet;
+	*packet_data_len = default_packet_len;
+
+	if (server_info->ecs_ipv4.enable == true || server_info->ecs_ipv6.enable == true) {
+		repack = 1;
+	}
+
+	if ((server_info->flags.server_flag & SERVER_FLAG_HITCHHIKING) != 0) {
+		hitchhiking = 1;
+		repack = 1;
+	}
+
+	if (repack == 0) {
+		/* no need to encode packet */
+		return 0;
+	}
+
+	/* init dns packet head */
+	memset(&head, 0, sizeof(head));
+	head.id = query->sid;
+	head.qr = DNS_QR_QUERY;
+	head.opcode = DNS_OP_QUERY;
+	head.aa = 0;
+	head.rd = 1;
+	head.ra = 0;
+	head.rcode = 0;
+
+	if (dns_packet_init(packet, DNS_PACKSIZE, &head) != 0) {
+		tlog(TLOG_ERROR, "init packet failed.");
+		return -1;
+	}
+
+	if (hitchhiking != 0 && dns_add_domain(packet, "-", query->qtype, DNS_C_IN) != 0) {
+		tlog(TLOG_ERROR, "add domain to packet failed.");
+		return -1;
+	}
+
+	/* add question */
+	if (dns_add_domain(packet, query->domain, query->qtype, DNS_C_IN) != 0) {
+		tlog(TLOG_ERROR, "add domain to packet failed.");
+		return -1;
+	}
+
+	dns_set_OPT_payload_size(packet, DNS_IN_PACKSIZE);
+	/* dns_add_OPT_TCP_KEEPALIVE(packet, 600); */
+	if ((query->qtype == DNS_T_A && server_info->ecs_ipv4.enable)) {
+		dns_add_OPT_ECS(packet, &server_info->ecs_ipv4.ecs);
+	} else if ((query->qtype == DNS_T_AAAA && server_info->ecs_ipv6.enable)) {
+		dns_add_OPT_ECS(packet, &server_info->ecs_ipv6.ecs);
+	} else {
+		if (server_info->ecs_ipv6.enable) {
+			dns_add_OPT_ECS(packet, &server_info->ecs_ipv6.ecs);
+		} else if (server_info->ecs_ipv4.enable) {
+			dns_add_OPT_ECS(packet, &server_info->ecs_ipv4.ecs);
+		}
+	}
+
+	/* encode packet */
+	encode_len = dns_encode(packet_data_buffer, DNS_IN_PACKSIZE, packet);
+	if (encode_len <= 0) {
+		tlog(TLOG_ERROR, "encode query failed.");
+		return -1;
+	}
+
+	if (encode_len > DNS_IN_PACKSIZE) {
+		BUG("size is invalid.");
+		return -1;
+	}
+
+	*packet_data = packet_data_buffer;
+	*packet_data_len = encode_len;
+
+	return 0;
+}
+
 static int _dns_client_send_packet(struct dns_query_struct *query, void *packet, int len)
 {
 	struct dns_server_info *server_info = NULL;
@@ -2888,10 +3455,15 @@ static int _dns_client_send_packet(struct dns_query_struct *query, void *packet,
 	int send_err = 0;
 	int i = 0;
 	int total_server = 0;
+	int send_count = 0;
+	void *packet_data = NULL;
+	int packet_data_len = 0;
+	unsigned char packet_data_buffer[DNS_IN_PACKSIZE];
 
 	query->send_tick = get_tick_count();
 
 	/* send query to all dns servers */
+	atomic_inc(&query->dns_request_sent);
 	for (i = 0; i < 2; i++) {
 		total_server = 0;
 		pthread_mutex_lock(&client.server_list_lock);
@@ -2899,46 +3471,66 @@ static int _dns_client_send_packet(struct dns_query_struct *query, void *packet,
 		{
 			server_info = group_member->server;
 			if (server_info->prohibit) {
+				if (server_info->is_already_prohibit == 0) {
+					server_info->is_already_prohibit = 1;
+					atomic_inc(&client.dns_server_prohibit_num);
+				}
+
 				time_t now = 0;
 				time(&now);
 				if ((now - 60 < server_info->last_send) && (now - 5 > server_info->last_recv)) {
 					continue;
 				}
 				server_info->prohibit = 0;
+				server_info->is_already_prohibit = 0;
+				atomic_dec(&client.dns_server_prohibit_num);
+				if (now - 60 > server_info->last_send) {
+					_dns_client_close_socket(server_info);
+				}
 			}
 			total_server++;
 			tlog(TLOG_DEBUG, "send query to server %s", server_info->ip);
 			if (server_info->fd <= 0) {
 				ret = _dns_client_create_socket(server_info);
 				if (ret != 0) {
+					server_info->prohibit = 1;
 					continue;
 				}
 			}
 
+			if (_dns_client_setup_server_packet(server_info, query, packet, len, packet_data_buffer, &packet_data,
+												&packet_data_len) != 0) {
+				continue;
+			}
+
 			atomic_inc(&query->dns_request_sent);
+			send_count++;
+			errno = 0;
+			server_info->send_tick = get_tick_count();
+
 			switch (server_info->type) {
 			case DNS_SERVER_UDP:
 				/* udp query */
-				ret = _dns_client_send_udp(server_info, packet, len);
+				ret = _dns_client_send_udp(server_info, packet_data, packet_data_len);
 				send_err = errno;
 				break;
 			case DNS_SERVER_TCP:
 				/* tcp query */
-				ret = _dns_client_send_tcp(server_info, packet, len);
+				ret = _dns_client_send_tcp(server_info, packet_data, packet_data_len);
 				send_err = errno;
 				break;
 			case DNS_SERVER_TLS:
 				/* tls query */
-				ret = _dns_client_send_tls(server_info, packet, len);
+				ret = _dns_client_send_tls(server_info, packet_data, packet_data_len);
 				send_err = errno;
 				break;
 			case DNS_SERVER_HTTPS:
 				/* https query */
-				ret = _dns_client_send_https(server_info, packet, len);
+				ret = _dns_client_send_https(server_info, packet_data, packet_data_len);
 				send_err = errno;
 				break;
 			default:
-				/* unsupport query type */
+				/* unsupported query type */
 				ret = -1;
 				break;
 			}
@@ -2949,6 +3541,7 @@ static int _dns_client_send_packet(struct dns_query_struct *query, void *packet,
 						 server_info->type);
 					_dns_client_close_socket(server_info);
 					atomic_dec(&query->dns_request_sent);
+					send_count--;
 					continue;
 				}
 
@@ -2956,26 +3549,39 @@ static int _dns_client_send_packet(struct dns_query_struct *query, void *packet,
 					 server_info->type);
 				time_t now = 0;
 				time(&now);
-				if (now - 5 > server_info->last_recv || send_err != ENOMEM) {
+				if (now - 10 > server_info->last_recv || send_err != ENOMEM) {
 					server_info->prohibit = 1;
 					tlog(TLOG_INFO, "server %s not alive, prohibit", server_info->ip);
 					_dns_client_shutdown_socket(server_info);
 				}
 
 				atomic_dec(&query->dns_request_sent);
+				send_count--;
 				continue;
 			}
 			time(&server_info->last_send);
 		}
 		pthread_mutex_unlock(&client.server_list_lock);
 
-		if (atomic_read(&query->dns_request_sent) > 0) {
+		if (send_count > 0) {
 			break;
 		}
 	}
 
-	if (atomic_read(&query->dns_request_sent) <= 0) {
-		tlog(TLOG_WARN, "Send query to upstream server failed, total server number %d", total_server);
+	int num = atomic_dec_return(&query->dns_request_sent);
+	if (num == 0 && send_count > 0) {
+		_dns_client_query_remove(query);
+	}
+
+	if (send_count <= 0) {
+		static time_t lastlog = 0;
+		time_t now = 0;
+		time(&now);
+		if (now - lastlog > 120) {
+			lastlog = now;
+			tlog(TLOG_WARN, "send query %s to upstream server failed, total server number %d", query->domain,
+				 total_server);
+		}
 		return -1;
 	}
 
@@ -2991,7 +3597,7 @@ static int _dns_client_dns_add_ecs(struct dns_query_struct *query, struct dns_pa
 	return dns_add_OPT_ECS(packet, &query->ecs.ecs);
 }
 
-static int _dns_client_send_query(struct dns_query_struct *query, const char *doamin)
+static int _dns_client_send_query(struct dns_query_struct *query)
 {
 	unsigned char packet_buff[DNS_PACKSIZE];
 	unsigned char inpacket[DNS_IN_PACKSIZE];
@@ -3015,13 +3621,13 @@ static int _dns_client_send_query(struct dns_query_struct *query, const char *do
 	}
 
 	/* add question */
-	if (dns_add_domain(packet, doamin, query->qtype, DNS_C_IN) != 0) {
+	if (dns_add_domain(packet, query->domain, query->qtype, DNS_C_IN) != 0) {
 		tlog(TLOG_ERROR, "add domain to packet failed.");
 		return -1;
 	}
 
 	dns_set_OPT_payload_size(packet, DNS_IN_PACKSIZE);
-	/* dns_add_OPT_TCP_KEEYALIVE(packet, 600); */
+	/* dns_add_OPT_TCP_KEEPALIVE(packet, 600); */
 	if (_dns_client_dns_add_ecs(query, packet) != 0) {
 		tlog(TLOG_ERROR, "add ecs failed.");
 		return -1;
@@ -3056,17 +3662,17 @@ static int _dns_client_query_setup_default_ecs(struct dns_query_struct *query)
 		if (client.ecs_ipv4.enable) {
 			add_ipv4_ecs = 1;
 		} else if (client.ecs_ipv6.enable) {
-			add_ipv4_ecs = 1;
+			add_ipv6_ecs = 1;
 		}
-	}
-
-	if (add_ipv4_ecs) {
-		memcpy(&query->ecs, &client.ecs_ipv4, sizeof(query->ecs));
-		return 0;
 	}
 
 	if (add_ipv6_ecs) {
 		memcpy(&query->ecs, &client.ecs_ipv6, sizeof(query->ecs));
+		return 0;
+	}
+
+	if (add_ipv4_ecs) {
+		memcpy(&query->ecs, &client.ecs_ipv4, sizeof(query->ecs));
 		return 0;
 	}
 
@@ -3136,12 +3742,61 @@ static int _dns_client_query_parser_options(struct dns_query_struct *query, stru
 	return 0;
 }
 
+static int _dns_client_add_hashmap(struct dns_query_struct *query)
+{
+	uint32_t key = 0;
+	struct hlist_node *tmp = NULL;
+	struct dns_query_struct *query_check = NULL;
+	int is_exists = 0;
+	int loop = 0;
+
+	while (loop++ <= 32) {
+		if (RAND_bytes((unsigned char *)&query->sid, sizeof(query->sid)) != 1) {
+			query->sid = random();
+		}
+
+		key = hash_string(query->domain);
+		key = jhash(&query->sid, sizeof(query->sid), key);
+		key = jhash(&query->qtype, sizeof(query->qtype), key);
+		is_exists = 0;
+		pthread_mutex_lock(&client.domain_map_lock);
+		hash_for_each_possible_safe(client.domain_map, query_check, tmp, domain_node, key)
+		{
+			if (query->sid != query_check->sid) {
+				continue;
+			}
+
+			if (query->qtype != query_check->qtype) {
+				continue;
+			}
+
+			if (strncmp(query_check->domain, query->domain, DNS_MAX_CNAME_LEN) != 0) {
+				continue;
+			}
+
+			is_exists = 1;
+			break;
+		}
+
+		if (is_exists == 1) {
+			pthread_mutex_unlock(&client.domain_map_lock);
+			continue;
+		}
+
+		hash_add(client.domain_map, &query->domain_node, key);
+		pthread_mutex_unlock(&client.domain_map_lock);
+		break;
+	}
+
+	return 0;
+}
+
 int dns_client_query(const char *domain, int qtype, dns_client_callback callback, void *user_ptr,
 					 const char *group_name, struct dns_query_options *options)
 {
 	struct dns_query_struct *query = NULL;
 	int ret = 0;
-	uint32_t key = 0;
+	int unused __attribute__((unused));
 
 	if (domain == NULL) {
 		goto errout;
@@ -3165,7 +3820,6 @@ int dns_client_query(const char *domain, int qtype, dns_client_callback callback
 	query->qtype = qtype;
 	query->send_tick = 0;
 	query->has_result = 0;
-	query->sid = atomic_inc_return(&dns_client_sid);
 	query->server_group = _dns_client_get_dnsserver_group(group_name);
 	if (query->server_group == NULL) {
 		tlog(TLOG_ERROR, "get dns server group %s failed.", group_name);
@@ -3179,15 +3833,14 @@ int dns_client_query(const char *domain, int qtype, dns_client_callback callback
 
 	_dns_client_query_get(query);
 	/* add query to hashtable */
-	key = hash_string(domain);
-	key = jhash(&query->sid, sizeof(query->sid), key);
-	pthread_mutex_lock(&client.domain_map_lock);
-	hash_add(client.domain_map, &query->domain_node, key);
-	pthread_mutex_unlock(&client.domain_map_lock);
+	if (_dns_client_add_hashmap(query) != 0) {
+		tlog(TLOG_ERROR, "add query to hash map failed.");
+		goto errout;
+	}
 
 	/* send query */
 	_dns_client_query_get(query);
-	ret = _dns_client_send_query(query, domain);
+	ret = _dns_client_send_query(query);
 	if (ret != 0) {
 		_dns_client_query_release(query);
 		goto errout_del_list;
@@ -3196,14 +3849,15 @@ int dns_client_query(const char *domain, int qtype, dns_client_callback callback
 	pthread_mutex_lock(&client.domain_map_lock);
 	if (hash_hashed(&query->domain_node)) {
 		if (list_empty(&client.dns_request_list)) {
-			pthread_cond_signal(&client.run_cond);
+			_dns_client_do_wakeup_event();
 		}
 
 		list_add_tail(&query->dns_request_list, &client.dns_request_list);
 	}
 	pthread_mutex_unlock(&client.domain_map_lock);
 
-	tlog(TLOG_INFO, "send request %s, qtype %d, id %d\n", domain, qtype, query->sid);
+	tlog(TLOG_INFO, "request: %s, qtype: %d, id: %d, group: %s", domain, qtype, query->sid,
+		 query->server_group->group_name);
 	_dns_client_query_release(query);
 
 	return 0;
@@ -3246,25 +3900,40 @@ static void _dns_client_check_servers(void)
 	pthread_mutex_unlock(&client.server_list_lock);
 }
 
-static int _dns_client_pending_server_resolve(const char *domain, dns_rtcode_t rtcode, dns_type_t addr_type, char *ip,
-											  unsigned int ping_time, void *user_ptr)
+static int _dns_client_pending_server_resolve(const struct dns_result *result, void *user_ptr)
 {
 	struct dns_server_pending *pending = user_ptr;
 	int ret = 0;
+	int has_soa = 0;
 
-	if (addr_type == DNS_T_A) {
+	if (result->rtcode == DNS_RC_NXDOMAIN || result->has_soa == 1 || result->rtcode == DNS_RC_REFUSED ||
+		(result->rtcode == DNS_RC_NOERROR && result->ip_num == 0)) {
+		has_soa = 1;
+	}
+
+	if (result->addr_type == DNS_T_A) {
 		pending->ping_time_v4 = -1;
-		if (rtcode == DNS_RC_NOERROR) {
+		if (result->rtcode == DNS_RC_NOERROR && result->ip_num > 0) {
 			pending->has_v4 = 1;
-			pending->ping_time_v4 = ping_time;
-			safe_strncpy(pending->ipv4, ip, DNS_HOSTNAME_LEN);
+			pending->ping_time_v4 = result->ping_time;
+			pending->has_soa_v4 = 0;
+			safe_strncpy(pending->ipv4, result->ip, DNS_HOSTNAME_LEN);
+		} else if (has_soa) {
+			pending->has_v4 = 0;
+			pending->ping_time_v4 = -1;
+			pending->has_soa_v4 = 1;
 		}
-	} else if (addr_type == DNS_T_AAAA) {
+	} else if (result->addr_type == DNS_T_AAAA) {
 		pending->ping_time_v6 = -1;
-		if (rtcode == DNS_RC_NOERROR) {
+		if (result->rtcode == DNS_RC_NOERROR && result->ip_num > 0) {
 			pending->has_v6 = 1;
-			pending->ping_time_v6 = ping_time;
-			safe_strncpy(pending->ipv6, ip, DNS_HOSTNAME_LEN);
+			pending->ping_time_v6 = result->ping_time;
+			pending->has_soa_v6 = 0;
+			safe_strncpy(pending->ipv6, result->ip, DNS_HOSTNAME_LEN);
+		} else if (has_soa) {
+			pending->has_v6 = 0;
+			pending->ping_time_v6 = -1;
+			pending->has_soa_v6 = 1;
 		}
 	} else {
 		ret = -1;
@@ -3285,7 +3954,8 @@ static int _dns_client_add_pendings(struct dns_server_pending *pending, char *ip
 
 	list_for_each_entry_safe(group, tmp, &pending->group_list, list)
 	{
-		if (_dns_client_add_to_group_pending(group->group_name, ip, pending->port, pending->type, 0) != 0) {
+		if (_dns_client_add_to_group_pending(group->group_name, ip, pending->port, pending->type, &pending->flags, 0) !=
+			0) {
 			tlog(TLOG_WARN, "add server to group failed, skip add.");
 		}
 
@@ -3314,23 +3984,28 @@ static void _dns_client_remove_all_pending_servers(void)
 	list_for_each_entry_safe(pending, tmp, &remove_list, retry_list)
 	{
 		list_del_init(&pending->retry_list);
-		_dns_client_server_pending_release(pending);
 		_dns_client_server_pending_remove(pending);
+		_dns_client_server_pending_release(pending);
 	}
 }
 
 static void _dns_client_add_pending_servers(void)
 {
+#ifdef TEST
+	const int delay_value = 1;
+#else
+	const int delay_value = 3;
+#endif
 	struct dns_server_pending *pending = NULL;
 	struct dns_server_pending *tmp = NULL;
-	static int dely = 0;
+	static int delay = delay_value;
 	LIST_HEAD(retry_list);
 
 	/* add pending server after 3 seconds */
-	if (++dely < 3) {
+	if (++delay < delay_value) {
 		return;
 	}
-	dely = 0;
+	delay = 0;
 
 	pthread_mutex_lock(&pending_server_mutex);
 	if (list_empty(&pending_servers)) {
@@ -3352,6 +4027,25 @@ static void _dns_client_add_pending_servers(void)
 		int add_success = 0;
 		char *dnsserver_ip = NULL;
 
+		/* if has no bootstrap DNS, just call getaddrinfo to get address */
+		if (dns_client_has_bootstrap_dns == 0) {
+			list_del_init(&pending->retry_list);
+			_dns_client_server_pending_release(pending);
+			pending->retry_cnt++;
+			if (_dns_client_add_pendings(pending, pending->host) != 0) {
+				pthread_mutex_unlock(&pending_server_mutex);
+				tlog(TLOG_INFO, "add pending DNS server %s from resolv.conf failed, retry %d...", pending->host,
+					 pending->retry_cnt - 1);
+				if (pending->retry_cnt - 1 > DNS_PENDING_SERVER_RETRY) {
+					tlog(TLOG_WARN, "add pending DNS server %s from resolv.conf failed, exit...", pending->host);
+					exit(1);
+				}
+				continue;
+			}
+			_dns_client_server_pending_release(pending);
+			continue;
+		}
+
 		if (pending->query_v4 == 0) {
 			pending->query_v4 = 1;
 			_dns_client_server_pending_get(pending);
@@ -3366,7 +4060,7 @@ static void _dns_client_add_pending_servers(void)
 			_dns_client_server_pending_get(pending);
 			if (dns_server_query(pending->host, DNS_T_AAAA, 0, _dns_client_pending_server_resolve, pending) != 0) {
 				_dns_client_server_pending_release(pending);
-				pending->query_v4 = 0;
+				pending->query_v6 = 0;
 			}
 		}
 
@@ -3397,6 +4091,12 @@ static void _dns_client_add_pending_servers(void)
 			continue;
 		}
 
+		if (dnsserver_ip == NULL && pending->has_soa_v4 && pending->has_soa_v6) {
+			tlog(TLOG_WARN, "add pending DNS server %s failed, no such host.", pending->host);
+			_dns_client_server_pending_remove(pending);
+			continue;
+		}
+
 		if (pending->retry_cnt - 1 > DNS_PENDING_SERVER_RETRY || add_success) {
 			if (add_success == 0) {
 				tlog(TLOG_WARN, "add pending DNS server %s failed.", pending->host);
@@ -3406,18 +4106,6 @@ static void _dns_client_add_pending_servers(void)
 			tlog(TLOG_INFO, "add pending DNS server %s failed, retry %d...", pending->host, pending->retry_cnt - 1);
 			pending->query_v4 = 0;
 			pending->query_v6 = 0;
-		}
-
-		/* if has no bootstrap DNS, just call getaddrinfo to get address */
-		if (dns_client_has_bootstrap_dns == 0) {
-			if (_dns_client_add_pendings(pending, pending->host) != 0) {
-				pthread_mutex_unlock(&pending_server_mutex);
-				tlog(TLOG_ERROR, "add pending DNS server %s failed", pending->host);
-				exit(1);
-				return;
-			}
-
-			_dns_client_server_pending_release(pending);
 		}
 	}
 }
@@ -3429,15 +4117,12 @@ static void _dns_client_period_run_second(void)
 	_dns_client_add_pending_servers();
 }
 
-static void _dns_client_period_run(void)
+static void _dns_client_period_run(unsigned int msec)
 {
 	struct dns_query_struct *query = NULL;
 	struct dns_query_struct *tmp = NULL;
-	static unsigned int msec = 0;
-	msec++;
 
 	LIST_HEAD(check_list);
-
 	unsigned long now = get_tick_count();
 
 	/* get query which timed out to check list */
@@ -3455,15 +4140,20 @@ static void _dns_client_period_run(void)
 	{
 		/* free timed out query, and notify caller */
 		list_del_init(&query->period_list);
-		_dns_client_check_udp_nat(query);
+
+		/* check udp nat after retrying. */
+		if (atomic_read(&query->retry_count) == 1) {
+			_dns_client_check_udp_nat(query);
+		}
+
 		if (atomic_dec_and_test(&query->retry_count) || (query->has_result != 0)) {
 			_dns_client_query_remove(query);
 			if (query->has_result == 0) {
-				tlog(TLOG_INFO, "retry query %s, type: %d, id: %d failed", query->domain, query->qtype, query->sid);
+				tlog(TLOG_DEBUG, "retry query %s, type: %d, id: %d failed", query->domain, query->qtype, query->sid);
 			}
 		} else {
-			tlog(TLOG_INFO, "retry query %s, type: %d, id: %d", query->domain, query->qtype, query->sid);
-			_dns_client_send_query(query, query->domain);
+			tlog(TLOG_DEBUG, "retry query %s, type: %d, id: %d", query->domain, query->qtype, query->sid);
+			_dns_client_send_query(query);
 		}
 		_dns_client_query_release(query);
 	}
@@ -3480,9 +4170,11 @@ static void *_dns_client_work(void *arg)
 	int i = 0;
 	unsigned long now = {0};
 	unsigned long last = {0};
+	unsigned int msec = 0;
 	unsigned int sleep = 100;
 	int sleep_time = 0;
 	unsigned long expect_time = 0;
+	int unused __attribute__((unused));
 
 	sleep_time = sleep;
 	now = get_tick_count() - sleep;
@@ -3495,27 +4187,38 @@ static void *_dns_client_work(void *arg)
 			if (sleep_time <= 0) {
 				sleep_time = 0;
 			}
+
+			int cnt = sleep_time / sleep;
+			msec -= cnt;
+			expect_time -= cnt * sleep;
+			sleep_time -= cnt * sleep;
 		}
-		last = now;
 
 		if (now >= expect_time) {
-			_dns_client_period_run();
+			msec++;
+			if (last != now) {
+				_dns_client_period_run(msec);
+			}
+
 			sleep_time = sleep - (now - expect_time);
 			if (sleep_time < 0) {
 				sleep_time = 0;
 				expect_time = now;
 			}
+
+			/* When client is idle, the sleep time is 1000ms, to reduce CPU usage */
+			pthread_mutex_lock(&client.domain_map_lock);
+			if (list_empty(&client.dns_request_list)) {
+				int cnt = 10 - (msec % 10) - 1;
+				sleep_time += sleep * cnt;
+				msec += cnt;
+				/* sleep to next second */
+				expect_time += sleep * cnt;
+			}
+			pthread_mutex_unlock(&client.domain_map_lock);
 			expect_time += sleep;
 		}
-
-		pthread_mutex_lock(&client.domain_map_lock);
-		if (list_empty(&client.dns_request_list) && atomic_read(&client.run_period) == 0) {
-			pthread_cond_wait(&client.run_cond, &client.domain_map_lock);
-			expect_time = get_tick_count();
-			pthread_mutex_unlock(&client.domain_map_lock);
-			continue;
-		}
-		pthread_mutex_unlock(&client.domain_map_lock);
+		last = now;
 
 		num = epoll_wait(client.epoll_fd, events, DNS_MAX_EVENTS, sleep_time);
 		if (num < 0) {
@@ -3526,6 +4229,11 @@ static void *_dns_client_work(void *arg)
 		for (i = 0; i < num; i++) {
 			struct epoll_event *event = &events[i];
 			struct dns_server_info *server_info = (struct dns_server_info *)event->data.ptr;
+			if (event->data.fd == client.fd_wakeup) {
+				_dns_client_clear_wakeup_event();
+				continue;
+			}
+
 			if (server_info == NULL) {
 				tlog(TLOG_WARN, "server info is invalid.");
 				continue;
@@ -3541,36 +4249,38 @@ static void *_dns_client_work(void *arg)
 	return NULL;
 }
 
-int dns_client_set_ecs(char *ip, int subnet)
+static int _dns_client_setup_ecs(char *ip, int subnet, struct dns_client_ecs *ecs_ipv4, struct dns_client_ecs *ecs_ipv6)
 {
 	struct sockaddr_storage addr;
 	socklen_t addr_len = sizeof(addr);
-	getaddr_by_host(ip, (struct sockaddr *)&addr, &addr_len);
+	if (getaddr_by_host(ip, (struct sockaddr *)&addr, &addr_len) != 0) {
+		return -1;
+	}
 
 	switch (addr.ss_family) {
 	case AF_INET: {
 		struct sockaddr_in *addr_in = NULL;
 		addr_in = (struct sockaddr_in *)&addr;
-		memcpy(&client.ecs_ipv4.ecs.addr, &addr_in->sin_addr.s_addr, 4);
-		client.ecs_ipv4.ecs.source_prefix = subnet;
-		client.ecs_ipv4.ecs.scope_prefix = 0;
-		client.ecs_ipv4.ecs.family = DNS_OPT_ECS_FAMILY_IPV4;
-		client.ecs_ipv4.enable = 1;
+		memcpy(&ecs_ipv4->ecs.addr, &addr_in->sin_addr.s_addr, 4);
+		ecs_ipv4->ecs.source_prefix = subnet;
+		ecs_ipv4->ecs.scope_prefix = 0;
+		ecs_ipv4->ecs.family = DNS_OPT_ECS_FAMILY_IPV4;
+		ecs_ipv4->enable = 1;
 	} break;
 	case AF_INET6: {
 		struct sockaddr_in6 *addr_in6 = NULL;
 		addr_in6 = (struct sockaddr_in6 *)&addr;
 		if (IN6_IS_ADDR_V4MAPPED(&addr_in6->sin6_addr)) {
-			client.ecs_ipv4.ecs.source_prefix = subnet;
-			client.ecs_ipv4.ecs.scope_prefix = 0;
-			client.ecs_ipv4.ecs.family = DNS_OPT_ECS_FAMILY_IPV4;
-			client.ecs_ipv4.enable = 1;
+			ecs_ipv4->ecs.source_prefix = subnet;
+			ecs_ipv4->ecs.scope_prefix = 0;
+			ecs_ipv4->ecs.family = DNS_OPT_ECS_FAMILY_IPV4;
+			ecs_ipv4->enable = 1;
 		} else {
-			memcpy(&client.ecs_ipv6.ecs.addr, addr_in6->sin6_addr.s6_addr, 16);
-			client.ecs_ipv6.ecs.source_prefix = subnet;
-			client.ecs_ipv6.ecs.scope_prefix = 0;
-			client.ecs_ipv6.ecs.family = DNS_ADDR_FAMILY_IPV6;
-			client.ecs_ipv6.enable = 1;
+			memcpy(&ecs_ipv6->ecs.addr, addr_in6->sin6_addr.s6_addr, 16);
+			ecs_ipv6->ecs.source_prefix = subnet;
+			ecs_ipv6->ecs.scope_prefix = 0;
+			ecs_ipv6->ecs.family = DNS_ADDR_FAMILY_IPV6;
+			ecs_ipv6->enable = 1;
 		}
 	} break;
 	default:
@@ -3579,19 +4289,88 @@ int dns_client_set_ecs(char *ip, int subnet)
 	return 0;
 }
 
+int dns_client_set_ecs(char *ip, int subnet)
+{
+	return _dns_client_setup_ecs(ip, subnet, &client.ecs_ipv4, &client.ecs_ipv6);
+}
+
+static int _dns_client_create_wakeup_event(void)
+{
+	int fd_wakeup = -1;
+
+	fd_wakeup = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+	if (fd_wakeup < 0) {
+		tlog(TLOG_ERROR, "create eventfd failed, %s\n", strerror(errno));
+		goto errout;
+	}
+
+	struct epoll_event event;
+	memset(&event, 0, sizeof(event));
+	event.events = EPOLLIN;
+	event.data.fd = fd_wakeup;
+	if (epoll_ctl(client.epoll_fd, EPOLL_CTL_ADD, fd_wakeup, &event) < 0) {
+		tlog(TLOG_ERROR, "add eventfd to epoll failed, %s\n", strerror(errno));
+		goto errout;
+	}
+
+	return fd_wakeup;
+
+errout:
+	if (fd_wakeup > 0) {
+		close(fd_wakeup);
+	}
+
+	return -1;
+}
+
+static void _dns_client_close_wakeup_event(void)
+{
+	if (client.fd_wakeup > 0) {
+		close(client.fd_wakeup);
+		client.fd_wakeup = -1;
+	}
+}
+
+static void _dns_client_clear_wakeup_event(void)
+{
+	uint64_t val = 0;
+	int unused __attribute__((unused));
+
+	if (client.fd_wakeup <= 0) {
+		return;
+	}
+
+	unused = read(client.fd_wakeup, &val, sizeof(val));
+}
+
+static void _dns_client_do_wakeup_event(void)
+{
+	uint64_t val = 1;
+	int unused __attribute__((unused));
+	if (client.fd_wakeup <= 0) {
+		return;
+	}
+
+	unused = write(client.fd_wakeup, &val, sizeof(val));
+}
+
 int dns_client_init(void)
 {
 	pthread_attr_t attr;
 	int epollfd = -1;
+	int fd_wakeup = -1;
 	int ret = 0;
 
 	if (client.epoll_fd > 0) {
 		return -1;
 	}
 
+	srandom(time(NULL));
+
 	memset(&client, 0, sizeof(client));
 	pthread_attr_init(&attr);
 	atomic_set(&client.dns_server_num, 0);
+	atomic_set(&client.dns_server_prohibit_num, 0);
 	atomic_set(&client.run_period, 0);
 
 	epollfd = epoll_create1(EPOLL_CLOEXEC);
@@ -3607,8 +4386,6 @@ int dns_client_init(void)
 	hash_init(client.domain_map);
 	hash_init(client.group);
 	INIT_LIST_HEAD(&client.dns_request_list);
-
-	pthread_cond_init(&client.run_cond, NULL);
 
 	if (dns_client_add_group(DNS_SERVER_GROUP_DEFAULT) != 0) {
 		tlog(TLOG_ERROR, "add default server group failed.");
@@ -3626,6 +4403,14 @@ int dns_client_init(void)
 		goto errout;
 	}
 
+	fd_wakeup = _dns_client_create_wakeup_event();
+	if (fd_wakeup < 0) {
+		tlog(TLOG_ERROR, "create wakeup event failed, %s\n", strerror(errno));
+		goto errout;
+	}
+
+	client.fd_wakeup = fd_wakeup;
+
 	return 0;
 errout:
 	if (client.tid) {
@@ -3635,13 +4420,16 @@ errout:
 		client.tid = 0;
 	}
 
-	if (epollfd) {
+	if (epollfd > 0) {
 		close(epollfd);
+	}
+
+	if (fd_wakeup > 0) {
+		close(fd_wakeup);
 	}
 
 	pthread_mutex_destroy(&client.server_list_lock);
 	pthread_mutex_destroy(&client.domain_map_lock);
-	pthread_cond_destroy(&client.run_cond);
 
 	return -1;
 }
@@ -3651,14 +4439,13 @@ void dns_client_exit(void)
 	if (client.tid) {
 		void *ret = NULL;
 		atomic_set(&client.run, 0);
-		pthread_mutex_lock(&client.domain_map_lock);
-		pthread_cond_signal(&client.run_cond);
-		pthread_mutex_unlock(&client.domain_map_lock);
+		_dns_client_do_wakeup_event();
 		pthread_join(client.tid, &ret);
 		client.tid = 0;
 	}
 
-	/* free all resouces */
+	/* free all resources */
+	_dns_client_close_wakeup_event();
 	_dns_client_remove_all_pending_servers();
 	_dns_client_server_remove_all();
 	_dns_client_query_remove_all();
@@ -3666,7 +4453,6 @@ void dns_client_exit(void)
 
 	pthread_mutex_destroy(&client.server_list_lock);
 	pthread_mutex_destroy(&client.domain_map_lock);
-	pthread_cond_destroy(&client.run_cond);
 	if (client.ssl_ctx) {
 		SSL_CTX_free(client.ssl_ctx);
 		client.ssl_ctx = NULL;
