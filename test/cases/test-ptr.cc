@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2023 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -53,11 +53,8 @@ TEST_F(Ptr, query)
 
 	server.Start(R"""(bind [::]:60053
 server 127.0.0.1:61053
-log-num 0
-log-console yes
 dualstack-ip-selection no
-log-level debug
-cache-persist no)""");
+)""");
 	smartdns::Client client;
 	ASSERT_TRUE(client.Query("4.3.2.1.in-addr.arpa PTR", 60053));
 	std::cout << client.GetResult() << std::endl;
@@ -87,14 +84,12 @@ TEST_F(Ptr, address_expand_ptr)
 
 	server.Start(R"""(bind [::]:60053
 server 127.0.0.1:61053
-log-num 0
-log-console yes
-log-level debug
 speed-check-mode none
 expand-ptr-from-address yes
 address /a.com/10.11.12.13
 address /a.com/64:ff9b::1010:1010
-cache-persist no)""");
+address /pi.local/192.168.1.1
+)""");
 	smartdns::Client client;
 	ASSERT_TRUE(client.Query("13.12.11.10.in-addr.arpa PTR", 60053));
 	std::cout << client.GetResult() << std::endl;
@@ -114,6 +109,15 @@ cache-persist no)""");
 	EXPECT_EQ(client.GetAnswer()[0].GetTTL(), 600);
 	EXPECT_EQ(client.GetAnswer()[0].GetType(), "PTR");
 	EXPECT_EQ(client.GetAnswer()[0].GetData(), "a.com.");
+
+	ASSERT_TRUE(client.Query("-x 192.168.1.1", 60053));
+	std::cout << client.GetResult() << std::endl;
+	ASSERT_EQ(client.GetAnswerNum(), 1);
+	EXPECT_EQ(client.GetStatus(), "NOERROR");
+	EXPECT_EQ(client.GetAnswer()[0].GetName(), "1.1.168.192.in-addr.arpa");
+	EXPECT_EQ(client.GetAnswer()[0].GetTTL(), 600);
+	EXPECT_EQ(client.GetAnswer()[0].GetType(), "PTR");
+	EXPECT_EQ(client.GetAnswer()[0].GetData(), "pi.local.");
 }
 
 TEST_F(Ptr, smartdns)
@@ -139,11 +143,8 @@ TEST_F(Ptr, smartdns)
 	server.Start(R"""(bind [::]:60053
 server 127.0.0.1:61053
 server-name my-server
-log-num 0
-log-console yes
 dualstack-ip-selection no
-log-level debug
-cache-persist no)""");
+)""");
 	smartdns::Client client;
 	ASSERT_TRUE(client.Query("1.0.0.127.in-addr.arpa PTR", 60053));
 	std::cout << client.GetResult() << std::endl;

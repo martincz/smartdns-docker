@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2023 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -41,10 +41,6 @@ TEST_F(DomainSet, set_add)
 	std::string config = "domain-set -name test-set -file " + file_set.GetPath() + "\n";
 	config += R"""(bind [::]:60053
 server 127.0.0.1:61053
-log-num 0
-log-console yes
-log-level info
-cache-persist no
 domain-rules /domain-set:test-set/ -c none --dualstack-ip-selection no -a 9.9.9.9
 )""";
 

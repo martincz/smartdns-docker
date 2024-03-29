@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2023 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -103,8 +103,21 @@ struct ipset_netlink_msg {
 	__be16 res_id;
 };
 
+enum daemon_msg_type {
+	DAEMON_MSG_KICKOFF,
+	DAEMON_MSG_KEEPALIVE,
+	DAEMON_MSG_DAEMON_PID,
+};
+
+struct daemon_msg {
+	enum daemon_msg_type type;
+	int value;
+};
+
 static int ipset_fd;
 static int pidfile_fd;
+static int daemon_fd;
+static int netlink_neighbor_fd;
 
 unsigned long get_tick_count(void)
 {
@@ -156,6 +169,83 @@ errout:
 	return NULL;
 }
 
+int generate_random_addr(unsigned char *addr, int addr_len, int mask)
+{
+	if (mask / 8 > addr_len) {
+		return -1;
+	}
+
+	int offset = mask / 8;
+	int bit = 0;
+
+	for (int i = offset; i < addr_len; i++) {
+		bit = 0xFF;
+		if (i == offset) {
+			bit = ~(0xFF << (8 - mask % 8)) & 0xFF;
+		}
+		addr[i] = jhash(&addr[i], 1, 0) & bit;
+	}
+
+	return 0;
+}
+
+int generate_addr_map(const unsigned char *addr_from, const unsigned char *addr_to, unsigned char *addr_out,
+					  int addr_len, int mask)
+{
+	if ((mask / 8) >= addr_len) {
+		if (mask % 8 != 0) {
+			return -1;
+		}
+	}
+
+	int offset = mask / 8;
+	int bit = mask % 8;
+	for (int i = 0; i < offset; i++) {
+		addr_out[i] = addr_to[i];
+	}
+
+	if (bit != 0) {
+		int mask1 = 0xFF >> bit;
+		int mask2 = (0xFF << (8 - bit)) & 0xFF;
+		addr_out[offset] = addr_from[offset] & mask1;
+		addr_out[offset] |= addr_to[offset] & mask2;
+		offset = offset + 1;
+	}
+
+	for (int i = offset; i < addr_len; i++) {
+		addr_out[i] = addr_from[i];
+	}
+
+	return 0;
+}
+
+int is_private_addr(const unsigned char *addr, int addr_len)
+{
+	if (addr_len == IPV4_ADDR_LEN) {
+		if (addr[0] == 10) {
+			return 1;
+		}
+
+		if (addr[0] == 172 && addr[1] >= 16 && addr[1] <= 31) {
+			return 1;
+		}
+
+		if (addr[0] == 192 && addr[1] == 168) {
+			return 1;
+		}
+	} else if (addr_len == IPV6_ADDR_LEN) {
+		if (addr[0] == 0xFD) {
+			return 1;
+		}
+
+		if (addr[0] == 0xFE && addr[1] == 0x80) {
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
 int getaddr_by_host(const char *host, struct sockaddr *addr, socklen_t *addr_len)
 {
 	struct addrinfo hints;
@@ -186,6 +276,52 @@ errout:
 	if (result) {
 		freeaddrinfo(result);
 	}
+	return -1;
+}
+
+int get_raw_addr_by_ip(const char *ip, unsigned char *raw_addr, int *raw_addr_len)
+{
+	struct sockaddr_storage addr;
+	socklen_t addr_len = sizeof(addr);
+
+	if (getaddr_by_host(ip, (struct sockaddr *)&addr, &addr_len) != 0) {
+		goto errout;
+	}
+
+	switch (addr.ss_family) {
+	case AF_INET: {
+		struct sockaddr_in *addr_in = NULL;
+		addr_in = (struct sockaddr_in *)&addr;
+		if (*raw_addr_len < DNS_RR_A_LEN) {
+			goto errout;
+		}
+		memcpy(raw_addr, &addr_in->sin_addr.s_addr, DNS_RR_A_LEN);
+		*raw_addr_len = DNS_RR_A_LEN;
+	} break;
+	case AF_INET6: {
+		struct sockaddr_in6 *addr_in6 = NULL;
+		addr_in6 = (struct sockaddr_in6 *)&addr;
+		if (IN6_IS_ADDR_V4MAPPED(&addr_in6->sin6_addr)) {
+			if (*raw_addr_len < DNS_RR_A_LEN) {
+				goto errout;
+			}
+			memcpy(raw_addr, addr_in6->sin6_addr.s6_addr + 12, DNS_RR_A_LEN);
+			*raw_addr_len = DNS_RR_A_LEN;
+		} else {
+			if (*raw_addr_len < DNS_RR_AAAA_LEN) {
+				goto errout;
+			}
+			memcpy(raw_addr, addr_in6->sin6_addr.s6_addr, DNS_RR_AAAA_LEN);
+			*raw_addr_len = DNS_RR_AAAA_LEN;
+		}
+	} break;
+	default:
+		goto errout;
+		break;
+	}
+
+	return 0;
+errout:
 	return -1;
 }
 
@@ -358,6 +494,11 @@ int check_is_ipv6(const char *ip)
 	while ((c = *ptr++) != '\0') {
 		if (c == '[' || c == ']') {
 			continue;
+		}
+
+		/* scope id, end of ipv6 address*/
+		if (c == '%') {
+			break;
 		}
 
 		if (c == ':') {
@@ -601,22 +742,13 @@ static int _ipset_socket_init(void)
 		return 0;
 	}
 
-	ipset_fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_NETFILTER);
+	ipset_fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_NETFILTER);
 
 	if (ipset_fd < 0) {
 		return -1;
 	}
 
 	return 0;
-}
-
-static int _ipset_support_timeout(void)
-{
-	if (dns_conf_ipset_timeout_enable) {
-		return 0;
-	}
-
-	return -1;
 }
 
 static int _ipset_operate(const char *ipset_name, const unsigned char addr[], int addr_len, unsigned long timeout,
@@ -684,7 +816,7 @@ static int _ipset_operate(const char *ipset_name, const unsigned char addr[], in
 					addr);
 	nested[1]->len = (void *)buffer + NETLINK_ALIGN(netlink_head->nlmsg_len) - (void *)nested[1];
 
-	if (timeout > 0 && _ipset_support_timeout() == 0) {
+	if (timeout > 0) {
 		expire = htonl(timeout);
 		_ipset_add_attr(netlink_head, IPSET_ATTR_TIMEOUT | NLA_F_NET_BYTEORDER, sizeof(expire), &expire);
 	}
@@ -719,6 +851,109 @@ int ipset_del(const char *ipset_name, const unsigned char addr[], int addr_len)
 	return _ipset_operate(ipset_name, addr, addr_len, 0, IPSET_DEL);
 }
 
+int netlink_get_neighbors(int family,
+						  int (*callback)(const uint8_t *net_addr, int net_addr_len, const uint8_t mac[6], void *arg),
+						  void *arg)
+{
+	if (netlink_neighbor_fd <= 0) {
+		netlink_neighbor_fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, NETLINK_ROUTE);
+		if (netlink_neighbor_fd < 0) {
+			return -1;
+		}
+	}
+
+	struct nlmsghdr *nlh;
+	struct ndmsg *ndm;
+	char buf[1024 * 16];
+	struct iovec iov = {buf, sizeof(buf)};
+	struct sockaddr_nl sa;
+	struct msghdr msg;
+	int len;
+	int ret = 0;
+
+	memset(&msg, 0, sizeof(msg));
+	msg.msg_name = &sa;
+	msg.msg_namelen = sizeof(sa);
+	msg.msg_iov = &iov;
+	msg.msg_iovlen = 1;
+
+	nlh = (struct nlmsghdr *)buf;
+	nlh->nlmsg_len = NLMSG_LENGTH(sizeof(struct ndmsg));
+	nlh->nlmsg_type = RTM_GETNEIGH;
+	nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+	nlh->nlmsg_seq = time(NULL);
+	nlh->nlmsg_pid = getpid();
+
+	ndm = NLMSG_DATA(nlh);
+	ndm->ndm_family = family;
+
+	if (send(netlink_neighbor_fd, buf, NLMSG_SPACE(sizeof(struct ndmsg)), 0) < 0) {
+		return -1;
+	}
+
+	while ((len = recvmsg(netlink_neighbor_fd, &msg, 0)) > 0) {
+		if (ret != 0) {
+			continue;
+		}
+
+		unsigned int rtalen = len;
+		for (nlh = (struct nlmsghdr *)buf; NLMSG_OK(nlh, rtalen); nlh = NLMSG_NEXT(nlh, rtalen)) {
+			ndm = NLMSG_DATA(nlh);
+			struct rtattr *rta = RTM_RTA(ndm);
+			const uint8_t *mac = NULL;
+			const uint8_t *net_addr = NULL;
+			int net_addr_len = 0;
+
+			for (; RTA_OK(rta, rtalen); rta = RTA_NEXT(rta, rtalen)) {
+				if (rta->rta_type == NDA_DST) {
+					if (ndm->ndm_family == AF_INET) {
+						struct in_addr *addr = RTA_DATA(rta);
+						if (IN_MULTICAST(ntohl(addr->s_addr))) {
+							continue;
+						}
+
+						if (ntohl(addr->s_addr) == 0) {
+							continue;
+						}
+
+						net_addr = (uint8_t *)&addr->s_addr;
+						net_addr_len = IPV4_ADDR_LEN;
+					} else if (ndm->ndm_family == AF_INET6) {
+						struct in6_addr *addr = RTA_DATA(rta);
+						if (IN6_IS_ADDR_MC_NODELOCAL(addr)) {
+							continue;
+						}
+						if (IN6_IS_ADDR_MC_LINKLOCAL(addr)) {
+							continue;
+						}
+						if (IN6_IS_ADDR_MC_SITELOCAL(addr)) {
+							continue;
+						}
+
+						if (IN6_IS_ADDR_UNSPECIFIED(addr)) {
+							continue;
+						}
+
+						net_addr = addr->s6_addr;
+						net_addr_len = IPV6_ADDR_LEN;
+					}
+				} else if (rta->rta_type == NDA_LLADDR) {
+					mac = RTA_DATA(rta);
+				}
+			}
+
+			if (net_addr != NULL && mac != NULL) {
+				ret = callback(net_addr, net_addr_len, mac, arg);
+				if (ret != 0) {
+					break;
+				}
+			}
+		}
+	}
+
+	return ret;
+}
+
 unsigned char *SSL_SHA256(const unsigned char *d, size_t n, unsigned char *md)
 {
 	static unsigned char m[SHA256_DIGEST_LENGTH];
@@ -741,10 +976,14 @@ unsigned char *SSL_SHA256(const unsigned char *d, size_t n, unsigned char *md)
 	return (md);
 }
 
-int SSL_base64_decode(const char *in, unsigned char *out)
+int SSL_base64_decode(const char *in, unsigned char *out, int max_outlen)
 {
 	size_t inlen = strlen(in);
 	int outlen = 0;
+
+	if (max_outlen < (int)inlen / 4 * 3) {
+		goto errout;
+	}
 
 	if (inlen == 0) {
 		return 0;
@@ -1003,6 +1242,10 @@ void SSL_CRYPTO_thread_setup(void)
 {
 	int i = 0;
 
+	if (lock_cs != NULL) {
+		return;
+	}
+
 	lock_cs = OPENSSL_malloc(CRYPTO_num_locks() * sizeof(pthread_mutex_t));
 	lock_count = OPENSSL_malloc(CRYPTO_num_locks() * sizeof(long));
 	if (!lock_cs || !lock_count) {
@@ -1032,12 +1275,18 @@ void SSL_CRYPTO_thread_cleanup(void)
 {
 	int i = 0;
 
+	if (lock_cs == NULL) {
+		return;
+	}
+
 	CRYPTO_set_locking_callback(NULL);
 	for (i = 0; i < CRYPTO_num_locks(); i++) {
 		pthread_mutex_destroy(&(lock_cs[i]));
 	}
 	OPENSSL_free(lock_cs);
 	OPENSSL_free(lock_count);
+	lock_cs = NULL;
+	lock_count = NULL;
 }
 #endif
 
@@ -1314,8 +1563,8 @@ int set_sock_keepalive(int fd, int keepidle, int keepinterval, int keepcnt)
 	}
 
 	setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
-	setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepinterval, sizeof(keepinterval));
-	setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepcnt, sizeof(keepcnt));
+	setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepinterval, sizeof(keepinterval));
+	setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
 
 	return 0;
 }
@@ -1433,7 +1682,7 @@ void bug_ext(const char *file, int line, const char *func, const char *errfmt, .
 
 int write_file(const char *filename, void *data, int data_len)
 {
-	int fd = open(filename, O_WRONLY | O_CREAT, 0644);
+	int fd = open(filename, O_WRONLY | O_CREAT | O_EXCL, 0644);
 	if (fd < 0) {
 		return -1;
 	}
@@ -1481,9 +1730,9 @@ int dns_packet_save(const char *dir, const char *type, const char *from, const v
 
 	snprintf(time_s, sizeof(time_s) - 1, "%.4d-%.2d-%.2d %.2d:%.2d:%.2d.%.3d", ptm->tm_year + 1900, ptm->tm_mon + 1,
 			 ptm->tm_mday, ptm->tm_hour, ptm->tm_min, ptm->tm_sec, (int)(tm_val.tv_usec / 1000));
-	snprintf(filename, sizeof(filename) - 1, "%s/%s-%.4d%.2d%.2d-%.2d%.2d%.2d%.1d.packet", dir, type,
+	snprintf(filename, sizeof(filename) - 1, "%s/%s-%.4d%.2d%.2d-%.2d%.2d%.2d%.3d.packet", dir, type,
 			 ptm->tm_year + 1900, ptm->tm_mon + 1, ptm->tm_mday, ptm->tm_hour, ptm->tm_min, ptm->tm_sec,
-			 (int)(tm_val.tv_usec / 100000));
+			 (int)(tm_val.tv_usec / 1000));
 
 	data = malloc(PACKET_BUF_SIZE);
 	if (data == NULL) {
@@ -1578,39 +1827,78 @@ errout:
 	return;
 }
 
-int daemon_kickoff(int fd, int status, int no_close)
+void daemon_close_stdfds(void)
 {
-	if (fd <= 0) {
+	int fd_null = open("/dev/null", O_RDWR);
+	if (fd_null < 0) {
+		fprintf(stderr, "open /dev/null failed, %s\n", strerror(errno));
+		return;
+	}
+
+	dup2(fd_null, STDIN_FILENO);
+	dup2(fd_null, STDOUT_FILENO);
+	dup2(fd_null, STDERR_FILENO);
+
+	if (fd_null > 2) {
+		close(fd_null);
+	}
+}
+
+int daemon_kickoff(int status, int no_close)
+{
+	struct daemon_msg msg;
+
+	if (daemon_fd <= 0) {
 		return -1;
 	}
 
-	int ret = write(fd, &status, sizeof(status));
-	if (ret != sizeof(status)) {
+	msg.type = DAEMON_MSG_KICKOFF;
+	msg.value = status;
+
+	int ret = write(daemon_fd, &msg, sizeof(msg));
+	if (ret != sizeof(msg)) {
+		fprintf(stderr, "notify parent process failed, %s\n", strerror(errno));
 		return -1;
 	}
 
 	if (no_close == 0) {
-		int fd_null = open("/dev/null", O_RDWR);
-		if (fd_null < 0) {
-			fprintf(stderr, "open /dev/null failed, %s\n", strerror(errno));
-			return -1;
-		}
-
-		dup2(fd_null, STDIN_FILENO);
-		dup2(fd_null, STDOUT_FILENO);
-		dup2(fd_null, STDERR_FILENO);
-
-		if (fd_null > 2) {
-			close(fd_null);
-		}
+		daemon_close_stdfds();
 	}
 
-	close(fd);
+	close(daemon_fd);
+	daemon_fd = -1;
 
 	return 0;
 }
 
-int run_daemon()
+int daemon_keepalive(void)
+{
+	struct daemon_msg msg;
+	static time_t last = 0;
+	time_t now = time(NULL);
+
+	if (daemon_fd <= 0) {
+		return -1;
+	}
+
+	if (now == last) {
+		return 0;
+	}
+
+	last = now;
+
+	msg.type = DAEMON_MSG_KEEPALIVE;
+	msg.value = 0;
+
+	int ret = write(daemon_fd, &msg, sizeof(msg));
+	if (ret != sizeof(msg)) {
+		return -1;
+	}
+
+	return 0;
+}
+
+daemon_ret daemon_run(int *wstatus)
 {
 	pid_t pid = 0;
 	int fds[2] = {0};
@@ -1629,7 +1917,6 @@ int run_daemon()
 	} else if (pid > 0) {
 		struct pollfd pfd;
 		int ret = 0;
-		int status = 0;
 
 		close(fds[1]);
 
@@ -1637,22 +1924,40 @@ int run_daemon()
 		pfd.events = POLLIN;
 		pfd.revents = 0;
 
-		ret = poll(&pfd, 1, 1000);
-		if (ret <= 0) {
-			fprintf(stderr, "run daemon process failed, wait child timeout\n");
-			goto errout;
-		}
+		do {
+			ret = poll(&pfd, 1, 3000);
+			if (ret <= 0) {
+				fprintf(stderr, "run daemon process failed, wait child timeout, kill child.\n");
+				goto errout;
+			}
 
-		if (!(pfd.revents & POLLIN)) {
-			goto errout;
-		}
+			if (!(pfd.revents & POLLIN)) {
+				goto errout;
+			}
 
-		ret = read(fds[0], &status, sizeof(status));
-		if (ret != sizeof(status)) {
-			goto errout;
-		}
+			struct daemon_msg msg;
 
-		return status;
+			ret = read(fds[0], &msg, sizeof(msg));
+			if (ret != sizeof(msg)) {
+				goto errout;
+			}
+
+			if (msg.type == DAEMON_MSG_KEEPALIVE) {
+				continue;
+			} else if (msg.type == DAEMON_MSG_DAEMON_PID) {
+				pid = msg.value;
+				continue;
+			} else if (msg.type == DAEMON_MSG_KICKOFF) {
+				if (wstatus != NULL) {
+					*wstatus = msg.value;
+				}
+				return DAEMON_RET_PARENT_OK;
+			} else {
+				goto errout;
+			}
+		} while (true);
+
+		return DAEMON_RET_ERR;
 	}
 
 	setsid();
@@ -1662,6 +1967,11 @@ int run_daemon()
 		fprintf(stderr, "double fork failed, %s\n", strerror(errno));
 		_exit(1);
 	} else if (pid > 0) {
+		struct daemon_msg msg;
+		int unused __attribute__((unused));
+		msg.type = DAEMON_MSG_DAEMON_PID;
+		msg.value = pid;
+		unused = write(fds[1], &msg, sizeof(msg));
 		_exit(0);
 	}
 
@@ -1670,14 +1980,41 @@ int run_daemon()
 		goto errout;
 	}
 	close(fds[0]);
-	return fds[1];
 
+	daemon_fd = fds[1];
+	return DAEMON_RET_CHILD_OK;
 errout:
 	kill(pid, SIGKILL);
+	if (wstatus != NULL) {
+		*wstatus = -1;
+	}
+	return DAEMON_RET_ERR;
+}
+
+int parser_mac_address(const char *in_mac, uint8_t mac[6])
+{
+	int fileld_num = 0;
+
+	if (in_mac == NULL) {
+		return -1;
+	}
+
+	fileld_num =
+		sscanf(in_mac, "%2hhx:%2hhx:%2hhx:%2hhx:%2hhx:%2hhx", &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]);
+	if (fileld_num == 6) {
+		return 0;
+	}
+
+	fileld_num =
+		sscanf(in_mac, "%2hhx-%2hhx-%2hhx-%2hhx-%2hhx-%2hhx", &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]);
+	if (fileld_num == 6) {
+		return 0;
+	}
+
 	return -1;
 }
 
-#ifdef DEBUG
+#if defined(DEBUG) || defined(TEST)
 struct _dns_read_packet_info {
 	int data_len;
 	int message_len;
@@ -1771,8 +2108,9 @@ static int _dns_debug_display(struct dns_packet *packet)
 	struct dns_rrs *rrs = NULL;
 	int rr_count = 0;
 	char req_host[MAX_IP_LEN];
+	int ret;
 
-	for (j = 1; j < DNS_RRS_END; j++) {
+	for (j = 1; j < DNS_RRS_OPT; j++) {
 		rrs = dns_get_rrs_start(packet, j, &rr_count);
 		printf("section: %d\n", j);
 		for (i = 0; i < rr_count && rrs; i++, rrs = dns_get_rrs_next(packet, rrs)) {
@@ -1794,12 +2132,29 @@ static int _dns_debug_display(struct dns_packet *packet)
 				inet_ntop(AF_INET6, addr, req_host, sizeof(req_host));
 				printf("domain: %s AAAA: %s TTL:%d\n", name, req_host, ttl);
 			} break;
+			case DNS_T_SRV: {
+				unsigned short priority = 0;
+				unsigned short weight = 0;
+				unsigned short port = 0;
+
+				char name[DNS_MAX_CNAME_LEN] = {0};
+				char target[DNS_MAX_CNAME_LEN];
+
+				ret = dns_get_SRV(rrs, name, DNS_MAX_CNAME_LEN, &ttl, &priority, &weight, &port, target,
+								  DNS_MAX_CNAME_LEN);
+				if (ret < 0) {
+					tlog(TLOG_DEBUG, "decode SRV failed, %s", name);
+					return -1;
+				}
+
+				printf("domain: %s SRV: %s TTL: %d priority: %d weight: %d port: %d\n", name, target, ttl, priority,
+					   weight, port);
+			} break;
 			case DNS_T_HTTPS: {
 				char name[DNS_MAX_CNAME_LEN] = {0};
 				char target[DNS_MAX_CNAME_LEN] = {0};
 				struct dns_https_param *p = NULL;
 				int priority = 0;
-				int ret = 0;
 
 				ret = dns_get_HTTPS_svcparm_start(rrs, &p, name, DNS_MAX_CNAME_LEN, &ttl, &priority, target,
 												  DNS_MAX_CNAME_LEN);
@@ -1876,10 +2231,6 @@ static int _dns_debug_display(struct dns_packet *packet)
 			case DNS_T_CNAME: {
 				char cname[DNS_MAX_CNAME_LEN];
 				char name[DNS_MAX_CNAME_LEN] = {0};
-				if (dns_conf_force_no_cname) {
-					continue;
-				}
-
 				dns_get_CNAME(rrs, name, DNS_MAX_CNAME_LEN, &ttl, cname, DNS_MAX_CNAME_LEN);
 				printf("domain: %s TTL: %d CNAME: %s\n", name, ttl, cname);
 			} break;
@@ -1896,6 +2247,48 @@ static int _dns_debug_display(struct dns_packet *packet)
 			}
 		}
 		printf("\n");
+	}
+
+	rr_count = 0;
+	rrs = dns_get_rrs_start(packet, DNS_RRS_OPT, &rr_count);
+	if (rr_count <= 0) {
+		return 0;
+	}
+
+	printf("section opt:\n");
+	for (i = 0; i < rr_count && rrs; i++, rrs = dns_get_rrs_next(packet, rrs)) {
+		switch (rrs->type) {
+		case DNS_OPT_T_TCP_KEEPALIVE: {
+			unsigned short idle_timeout = 0;
+			ret = dns_get_OPT_TCP_KEEPALIVE(rrs, &idle_timeout);
+			if (idle_timeout == 0) {
+				continue;
+			}
+
+			printf("tcp keepalive: %d\n", idle_timeout);
+		} break;
+		case DNS_OPT_T_ECS: {
+			struct dns_opt_ecs ecs;
+			memset(&ecs, 0, sizeof(ecs));
+			ret = dns_get_OPT_ECS(rrs, &ecs);
+			if (ret != 0) {
+				continue;
+			}
+			printf("ecs family: %d, src_prefix: %d, scope_prefix: %d, ", ecs.family, ecs.source_prefix,
+				   ecs.scope_prefix);
+			if (ecs.family == 1) {
+				char ip[16] = {0};
+				inet_ntop(AF_INET, ecs.addr, ip, sizeof(ip));
+				printf("ecs address: %s\n", ip);
+			} else if (ecs.family == 2) {
+				char ip[64] = {0};
+				inet_ntop(AF_INET6, ecs.addr, ip, sizeof(ip));
+				printf("ecs address: %s\n", ip);
+			}
+		} break;
+		default:
+			break;
+		}
 	}
 
 	return 0;

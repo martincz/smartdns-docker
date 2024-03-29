@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2023 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -31,7 +31,9 @@ extern "C" {
 #define DNS_PACKSIZE (512 * 16)
 #define DNS_DEFAULT_PACKET_SIZE 512
 #define DNS_MAX_ALPN_LEN 32
-#define DNS_MAX_ECH_LEN 256
+#define DNS_MAX_ECH_LEN 512
+
+#define DNS_OPT_FLAG_DO 0x8000
 
 #define DNS_ADDR_FAMILY_IP 1
 #define DNS_ADDR_FAMILY_IPV6 2
@@ -72,6 +74,7 @@ typedef enum dns_type {
 	DNS_T_SRV = 33,
 	DNS_T_OPT = 41,
 	DNS_T_SSHFP = 44,
+	DNS_T_SVCB = 64,
 	DNS_T_HTTPS = 65,
 	DNS_T_SPF = 99,
 	DNS_T_AXFR = 252,
@@ -131,6 +134,10 @@ struct dns_head {
 	unsigned char tc;       /* Truncation Flag */
 	unsigned char rd;       /* Recursion Desired */
 	unsigned char ra;       /* Recursion Available */
+	unsigned char z;        /* Reserved for future use.  Must be Zero! */
+	unsigned char ad;       /* Authentic Data Flag */
+	unsigned char cd;       /* Checking Disabled Flag */
+	unsigned char padding;  /* Padding */
 	unsigned short rcode;   /* Response Code */
 	unsigned short qdcount; /* number of question entries */
 	unsigned short ancount; /* number of answer entries */
@@ -142,12 +149,12 @@ struct dns_head {
 struct dns_packet_dict_item {
 	unsigned short pos;
 	unsigned int hash;
-};
+} __attribute__((packed));
 
 struct dns_packet_dict {
 	short dict_count;
 	struct dns_packet_dict_item names[DNS_PACKET_DICT_SIZE];
-};
+} __attribute__((packed));
 
 /* packet head */
 struct dns_packet {
@@ -159,6 +166,7 @@ struct dns_packet {
 	unsigned short optcount;
 	unsigned short optional;
 	unsigned short payloadsize;
+	unsigned int opt_option;
 	struct dns_packet_dict namedict;
 	int size;
 	int len;
@@ -171,7 +179,7 @@ struct dns_rrs {
 	unsigned short len;
 	int type;
 	unsigned char data[0];
-};
+} __attribute__((packed));
 
 /* packet encode/decode context */
 struct dns_context {
@@ -275,15 +283,22 @@ int dns_get_SOA(struct dns_rrs *rrs, char *domain, int maxsize, int *ttl, struct
 int dns_add_NS(struct dns_packet *packet, dns_rr_type type, const char *domain, int ttl, const char *cname);
 int dns_get_NS(struct dns_rrs *rrs, char *domain, int maxsize, int *ttl, char *cname, int cname_size);
 
+int dns_set_OPT_option(struct dns_packet *packet, unsigned int option);
+unsigned int dns_get_OPT_option(struct dns_packet *packet);
+
 int dns_set_OPT_payload_size(struct dns_packet *packet, int payload_size);
 int dns_get_OPT_payload_size(struct dns_packet *packet);
 
 int dns_add_OPT_ECS(struct dns_packet *packet, struct dns_opt_ecs *ecs);
-int dns_get_OPT_ECS(struct dns_rrs *rrs, unsigned short *opt_code, unsigned short *opt_len, struct dns_opt_ecs *ecs);
+int dns_get_OPT_ECS(struct dns_rrs *rrs, struct dns_opt_ecs *ecs);
 
 int dns_add_OPT_TCP_KEEPALIVE(struct dns_packet *packet, unsigned short timeout);
-int dns_get_OPT_TCP_KEEPALIVE(struct dns_rrs *rrs, unsigned short *opt_code, unsigned short *opt_len,
-							  unsigned short *timeout);
+int dns_get_OPT_TCP_KEEPALIVE(struct dns_rrs *rrs, unsigned short *timeout);
+
+int dns_add_SRV(struct dns_packet *packet, dns_rr_type type, const char *domain, int ttl, int priority, int weight,
+				int port, const char *target);
+int dns_get_SRV(struct dns_rrs *rrs, char *domain, int maxsize, int *ttl, unsigned short *priority,
+				unsigned short *weight, unsigned short *port, char *target, int target_size);
 
 /* the key must be added in orders, or dig will report FORMERR */
 int dns_add_HTTPS_start(struct dns_rr_nested *svcparam_buffer, struct dns_packet *packet, dns_rr_type type,
@@ -310,6 +325,7 @@ struct dns_https_param *dns_get_HTTPS_svcparm_next(struct dns_rrs *rrs, struct d
 /*
  * Packet operation
  */
+int dns_decode_head_only(struct dns_packet *packet, int maxsize, unsigned char *data, int size);
 int dns_decode(struct dns_packet *packet, int maxsize, unsigned char *data, int size);
 int dns_encode(unsigned char *data, int size, struct dns_packet *packet);
 

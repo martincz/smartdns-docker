@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2023 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -87,6 +87,7 @@ struct ServerRequestContext {
 typedef enum {
 	SERVER_REQUEST_OK = 0,
 	SERVER_REQUEST_ERROR,
+	SERVER_REQUEST_NO_RESPONSE,
 	SERVER_REQUEST_SOA,
 } ServerRequestResult;
 

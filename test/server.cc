@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2023 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -153,6 +153,8 @@ void MockServer::Run()
 				dns_add_domain(request.response_packet, request.domain.c_str(), request.qtype, request.qclass);
 				request.response_data_len =
 					dns_encode(request.response_data, request.response_data_max_len, request.response_packet);
+			} else if (callback_ret == SERVER_REQUEST_NO_RESPONSE) {
+				continue;
 			} else if (request.response_data_len == 0) {
 				if (callback_ret == SERVER_REQUEST_OK) {
 					request.response_data_len =
@@ -344,8 +346,16 @@ bool Server::Start(const std::string &conf, enum CONF_TYPE type)
 		}
 	};
 
+	const char *default_conf = R"""(
+log-num 0
+log-console yes
+log-level debug
+cache-persist no
+)""";
+
 	if (type == CONF_TYPE_STRING) {
 		conf_temp_file_.SetPattern("/tmp/smartdns_conf.XXXXXX");
+		conf_temp_file_.Write(default_conf);
 		conf_temp_file_.Write(conf);
 		conf_file = conf_temp_file_.GetPath();
 	} else if (type == CONF_TYPE_FILE) {
@@ -376,23 +386,21 @@ bool Server::Start(const std::string &conf, enum CONF_TYPE type)
 			}
 
 			smartdns_reg_post_func(Server::StartPost, this);
-			smartdns_main(args.size(), argv, fds[1]);
+			smartdns_main(args.size(), argv, fds[1], 0);
 			_exit(1);
 		} else if (pid < 0) {
 			return false;
 		}
 	} else if (mode_ == CREATE_MODE_THREAD) {
 		thread_ = std::thread([&]() {
-			std::vector<std::string> args = {
-				"smartdns", "-f", "-x", "-c", conf_file_, "-p", "-",
-			};
+			std::vector<std::string> args = {"smartdns", "-f", "-x", "-c", conf_file_, "-p", "-", "-S"};
 			char *argv[args.size() + 1];
 			for (size_t i = 0; i < args.size(); i++) {
 				argv[i] = (char *)args[i].c_str();
 			}
 
 			smartdns_reg_post_func(Server::StartPost, this);
-			smartdns_main(args.size(), argv, fds[1]);
+			smartdns_main(args.size(), argv, fds[1], 1);
 			smartdns_reg_post_func(nullptr, nullptr);
 		});
 	} else {

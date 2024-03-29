@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2023 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -55,7 +55,7 @@ TEST_F(SubNet, pass_subnet)
 
 		for (i = 0; i < rr_count && rrs; i++, rrs = dns_get_rrs_next(request->packet, rrs)) {
 			memset(&ecs, 0, sizeof(ecs));
-			ret = dns_get_OPT_ECS(rrs, NULL, NULL, &ecs);
+			ret = dns_get_OPT_ECS(rrs, &ecs);
 			if (ret != 0) {
 				continue;
 			}
@@ -85,11 +85,8 @@ TEST_F(SubNet, pass_subnet)
 
 	server.Start(R"""(bind [::]:60053
 server 127.0.0.1:61053
-log-num 0
-log-console yes
 dualstack-ip-selection no
-log-level debug
-cache-persist no)""");
+)""");
 	smartdns::Client client;
 	ASSERT_TRUE(client.Query("a.com A +subnet=8.8.8.8/24", 60053));
 	std::cout << client.GetResult() << std::endl;
@@ -125,7 +122,7 @@ TEST_F(SubNet, conf)
 
 		for (i = 0; i < rr_count && rrs; i++, rrs = dns_get_rrs_next(request->packet, rrs)) {
 			memset(&ecs, 0, sizeof(ecs));
-			ret = dns_get_OPT_ECS(rrs, NULL, NULL, &ecs);
+			ret = dns_get_OPT_ECS(rrs, &ecs);
 			if (ret != 0) {
 				continue;
 			}
@@ -155,12 +152,9 @@ TEST_F(SubNet, conf)
 
 	server.Start(R"""(bind [::]:60053
 server 127.0.0.1:61053
-log-num 0
-log-console yes
 dualstack-ip-selection no
 edns-client-subnet 8.8.8.8/24
-log-level debug
-cache-persist no)""");
+)""");
 	smartdns::Client client;
 	ASSERT_TRUE(client.Query("a.com A", 60053));
 	std::cout << client.GetResult() << std::endl;
@@ -196,7 +190,7 @@ TEST_F(SubNet, conf_v6)
 
 		for (i = 0; i < rr_count && rrs; i++, rrs = dns_get_rrs_next(request->packet, rrs)) {
 			memset(&ecs, 0, sizeof(ecs));
-			ret = dns_get_OPT_ECS(rrs, NULL, NULL, &ecs);
+			ret = dns_get_OPT_ECS(rrs, &ecs);
 			if (ret != 0) {
 				continue;
 			}
@@ -228,12 +222,9 @@ TEST_F(SubNet, conf_v6)
 
 	server.Start(R"""(bind [::]:60053
 server 127.0.0.1:61053
-log-num 0
-log-console yes
 dualstack-ip-selection no
 edns-client-subnet ffff:ffff:ffff:ffff:ffff::/64
-log-level debug
-cache-persist no)""");
+)""");
 	smartdns::Client client;
 	ASSERT_TRUE(client.Query("a.com AAAA", 60053));
 	std::cout << client.GetResult() << std::endl;
@@ -269,7 +260,7 @@ TEST_F(SubNet, v4_server_subnet_txt)
 
 		for (i = 0; i < rr_count && rrs; i++, rrs = dns_get_rrs_next(request->packet, rrs)) {
 			memset(&ecs, 0, sizeof(ecs));
-			ret = dns_get_OPT_ECS(rrs, NULL, NULL, &ecs);
+			ret = dns_get_OPT_ECS(rrs, &ecs);
 			if (ret != 0) {
 				continue;
 			}
@@ -299,12 +290,9 @@ TEST_F(SubNet, v4_server_subnet_txt)
 
 	server.Start(R"""(bind [::]:60053
 server 127.0.0.1:61053 -subnet 8.8.8.8/24
-log-num 0
-log-console yes
 dualstack-ip-selection no
-log-level debug
 rr-ttl-min 0
-cache-persist no)""");
+)""");
 	smartdns::Client client;
 	ASSERT_TRUE(client.Query("a.com TXT", 60053));
 	std::cout << client.GetResult() << std::endl;
@@ -340,7 +328,7 @@ TEST_F(SubNet, v6_default_subnet_txt)
 
 		for (i = 0; i < rr_count && rrs; i++, rrs = dns_get_rrs_next(request->packet, rrs)) {
 			memset(&ecs, 0, sizeof(ecs));
-			ret = dns_get_OPT_ECS(rrs, NULL, NULL, &ecs);
+			ret = dns_get_OPT_ECS(rrs, &ecs);
 			if (ret != 0) {
 				continue;
 			}
@@ -369,13 +357,10 @@ TEST_F(SubNet, v6_default_subnet_txt)
 
 	server.Start(R"""(bind [::]:60053
 server 127.0.0.1:61053
-log-num 0
-log-console yes
 dualstack-ip-selection no
 rr-ttl-min 0
 edns-client-subnet ffff:ffff:ffff:ffff:ffff::/64
-log-level debug
-cache-persist no)""");
+)""");
 	smartdns::Client client;
 	ASSERT_TRUE(client.Query("a.com TXT", 60053));
 	std::cout << client.GetResult() << std::endl;
@@ -410,7 +395,7 @@ TEST_F(SubNet, per_server)
 
 			for (i = 0; i < rr_count && rrs; i++, rrs = dns_get_rrs_next(request->packet, rrs)) {
 				memset(&ecs, 0, sizeof(ecs));
-				ret = dns_get_OPT_ECS(rrs, NULL, NULL, &ecs);
+				ret = dns_get_OPT_ECS(rrs, &ecs);
 				if (ret != 0) {
 					continue;
 				}
@@ -442,7 +427,7 @@ TEST_F(SubNet, per_server)
 
 			for (i = 0; i < rr_count && rrs; i++, rrs = dns_get_rrs_next(request->packet, rrs)) {
 				memset(&ecs, 0, sizeof(ecs));
-				ret = dns_get_OPT_ECS(rrs, NULL, NULL, &ecs);
+				ret = dns_get_OPT_ECS(rrs, &ecs);
 				if (ret != 0) {
 					continue;
 				}
@@ -479,7 +464,7 @@ TEST_F(SubNet, per_server)
 
 			for (i = 0; i < rr_count && rrs; i++, rrs = dns_get_rrs_next(request->packet, rrs)) {
 				memset(&ecs, 0, sizeof(ecs));
-				ret = dns_get_OPT_ECS(rrs, NULL, NULL, &ecs);
+				ret = dns_get_OPT_ECS(rrs, &ecs);
 				if (ret != 0) {
 					continue;
 				}
@@ -524,7 +509,7 @@ TEST_F(SubNet, per_server)
 
 			for (i = 0; i < rr_count && rrs; i++, rrs = dns_get_rrs_next(request->packet, rrs)) {
 				memset(&ecs, 0, sizeof(ecs));
-				ret = dns_get_OPT_ECS(rrs, NULL, NULL, &ecs);
+				ret = dns_get_OPT_ECS(rrs, &ecs);
 				if (ret != 0) {
 					continue;
 				}
@@ -563,11 +548,8 @@ TEST_F(SubNet, per_server)
 	server.Start(R"""(bind [::]:60053
 server 127.0.0.1:62053 -subnet=8.8.8.8/24 -subnet=ffff:ffff:ffff:ffff:ffff::/64
 server 127.0.0.1:61053
-log-num 0
-log-console yes
 dualstack-ip-selection no
-log-level debug
-cache-persist no)""");
+)""");
 	smartdns::Client client;
 	ASSERT_TRUE(client.Query("a.com A", 60053));
 	std::cout << client.GetResult() << std::endl;

@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2023 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -53,10 +53,7 @@ TEST(DiscardBlockIP, first_ping)
 	server.Start(R"""(bind [::]:60053
 server 127.0.0.1:61053
 server 127.0.0.1:62053
-log-num 0
-log-console yes
-log-level debug
-cache-persist no)""");
+)""");
 	smartdns::Client client;
 	ASSERT_TRUE(client.Query("a.com", 60053));
 	std::cout << client.GetResult() << std::endl;
@@ -91,11 +88,8 @@ TEST(DiscardBlockIP, first_response)
 	server.Start(R"""(bind [::]:60053
 server 127.0.0.1:61053
 server 127.0.0.1:62053
-log-num 0
-log-console yes
-log-level debug
 response-mode fastest-response
-cache-persist no)""");
+)""");
 	smartdns::Client client;
 	ASSERT_TRUE(client.Query("a.com", 60053));
 	std::cout << client.GetResult() << std::endl;

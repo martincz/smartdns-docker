@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2023 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -21,6 +21,7 @@
 
 #include "bitmap.h"
 #include "jhash.h"
+#include <ctype.h>
 
 /* Fast hashing routine for ints,  longs and pointers.
    (C) 2002 Nadia Yvette Chambers, IBM */
@@ -223,9 +224,26 @@ static inline uint32_t hash_string_initval(const char *s, uint32_t initval)
 	return h;
 }
 
+static inline uint32_t hash_string_case_initval(const char *s, uint32_t initval)
+{
+	uint32_t h = initval;
+
+	while (*s) {
+		h = h * 31 + tolower(*s);
+		s++;
+	}
+
+	return h;
+}
+
 static inline uint32_t hash_string(const char *s)
 {
 	return hash_string_initval(s, 0);
+}
+
+static inline uint32_t hash_string_case(const char *s)
+{
+	return hash_string_case_initval(s, 0);
 }
 
 static inline uint32_t hash_string_array(const char **a)

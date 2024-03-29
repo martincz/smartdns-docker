@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2023 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -56,7 +56,7 @@ struct proxy_conn;
 
 int proxy_init(void);
 
-int proxy_exit(void);
+void proxy_exit(void);
 
 int proxy_add(const char *proxy_name, struct proxy_info *info);
 

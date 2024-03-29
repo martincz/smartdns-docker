@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2023 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -95,8 +95,9 @@ struct proxy_struct {
 };
 
 static struct proxy_struct proxy;
+static int is_proxy_init;
 
-const char *proxy_socks5_status_code[] = {
+static const char *proxy_socks5_status_code[] = {
 	"success",
 	"general SOCKS server failure",
 	"connection not allowed by ruleset",
@@ -234,7 +235,7 @@ int proxy_remove(const char *proxy_name)
 
 static void _proxy_remove_all(void)
 {
-	struct proxy_server_info *server_info;
+	struct proxy_server_info *server_info = NULL;
 	struct hlist_node *tmp = NULL;
 	unsigned int i = 0;
 
@@ -957,7 +958,7 @@ int proxy_conn_recvfrom(struct proxy_conn *proxy_conn, void *buf, size_t len, in
 		return -1;
 	}
 
-	ret = recvfrom(proxy_conn->udp_fd, buffer, sizeof(buffer), MSG_NOSIGNAL, NULL, 0);
+	ret = recvfrom(proxy_conn->udp_fd, buffer, sizeof(buffer), MSG_NOSIGNAL, NULL, NULL);
 	if (ret <= 0) {
 		return -1;
 	}
@@ -1043,15 +1044,26 @@ int proxy_conn_is_udp(struct proxy_conn *proxy_conn)
 	return proxy_conn->is_udp;
 }
 
-int proxy_init()
+int proxy_init(void)
 {
+	if (is_proxy_init == 1) {
+		return -1;
+	}
+
 	memset(&proxy, 0, sizeof(proxy));
 	hash_init(proxy.proxy_server);
+	is_proxy_init = 1;
 	return 0;
 }
 
-int proxy_exit()
+void proxy_exit(void)
 {
+	if (is_proxy_init == 0) {
+		return;
+	}
 	_proxy_remove_all();
-	return 0;
+
+	is_proxy_init = 0;
+	
+	return ;
 }

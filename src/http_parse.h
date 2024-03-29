@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2023 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -25,6 +25,7 @@ extern "C" {
 
 struct http_head;
 struct http_head_fields;
+struct http_params;
 
 typedef enum HTTP_METHOD {
 	HTTP_METHOD_INVALID = 0,
@@ -66,6 +67,12 @@ struct http_head_fields *http_head_first_fields(struct http_head *http_head);
 struct http_head_fields *http_head_next_fields(struct http_head_fields *fields);
 
 const char *http_head_get_fields_value(struct http_head *http_head, const char *name);
+
+const char *http_head_fields_get_name(struct http_head_fields *fields);
+
+const char *http_head_fields_get_value(struct http_head_fields *fields);
+
+const char *http_head_get_params_value(struct http_head *http_head, const char *name);
 
 int http_head_lookup_fields(struct http_head_fields *fields, const char **name, const char **value);
 

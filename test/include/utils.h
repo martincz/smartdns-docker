@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2023 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -106,6 +106,8 @@ bool IsCommandExists(const std::string &cmd);
 std::string GenerateRandomString(int len);
 
 int ParserArg(const std::string &cmd, std::vector<std::string> &args);
+
+std::vector<std::string> GetAvailableIPAddresses();
 
 } // namespace smartdns
 #endif // _SMARTDNS_TEST_UTILS_

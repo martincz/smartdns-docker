@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2023 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -25,6 +25,7 @@
 #include "hash.h"
 #include "hashtable.h"
 #include "list.h"
+#include "timer.h"
 #include <stdlib.h>
 #include <time.h>
 
@@ -39,21 +40,8 @@ extern "C" {
 #define MAGIC_CACHE_DATA 0x61546144
 #define MAGIC_RECORD 0x64526352
 
-enum CACHE_TYPE {
-	CACHE_TYPE_NONE,
-	CACHE_TYPE_ADDR,
-	CACHE_TYPE_PACKET,
-};
-
-enum CACHE_RECORD_TYPE {
-	CACHE_RECORD_TYPE_ACTIVE,
-	CACHE_RECORD_TYPE_INACTIVE,
-	CACHE_RECORD_TYPE_END,
-};
-
 struct dns_cache_data_head {
-	enum CACHE_TYPE cache_type;
-	int is_soa;
+	atomic_t ref;
 	ssize_t size;
 	uint32_t magic;
 };
@@ -88,9 +76,10 @@ struct dns_cache_info {
 	char dns_group_name[DNS_GROUP_NAME_LEN];
 	uint32_t query_flag;
 	int ttl;
+	int rcode;
 	int hitnum;
 	int speed;
-	int no_inactive;
+	int timeout;
 	int hitnum_update_add;
 	int is_visited;
 	time_t insert_time;
@@ -99,7 +88,6 @@ struct dns_cache_info {
 
 struct dns_cache_record {
 	uint32_t magic;
-	enum CACHE_RECORD_TYPE type;
 	struct dns_cache_info info;
 };
 
@@ -113,6 +101,8 @@ struct dns_cache {
 
 	struct dns_cache_info info;
 	struct dns_cache_data *cache_data;
+
+	struct tw_timer_list timer;
 };
 
 struct dns_cache_file {
@@ -128,27 +118,35 @@ struct dns_cache_key {
 	uint32_t query_flag;
 };
 
-enum CACHE_TYPE dns_cache_data_type(struct dns_cache_data *cache_data);
-
 uint32_t dns_cache_get_query_flag(struct dns_cache *dns_cache);
 
 const char *dns_cache_get_dns_group_name(struct dns_cache *dns_cache);
 
-void dns_cache_data_free(struct dns_cache_data *data);
-
 struct dns_cache_data *dns_cache_new_data_packet(void *packet, size_t packet_len);
 
-int dns_cache_init(int size, int enable_inactive, int inactive_list_expired);
+typedef enum DNS_CACHE_TMOUT_ACTION {
+	DNS_CACHE_TMOUT_ACTION_OK = 0,
+	DNS_CACHE_TMOUT_ACTION_DEL = 1,
+	DNS_CACHE_TMOUT_ACTION_RETRY = 2,
+} dns_cache_tmout_action_t;
 
-int dns_cache_replace(struct dns_cache_key *key, int ttl, int speed, int no_inactive,
+typedef dns_cache_tmout_action_t (*dns_cache_callback)(struct dns_cache *dns_cache);
+
+int dns_cache_init(int size, int mem_size, dns_cache_callback timeout_callback);
+
+int dns_cache_replace(struct dns_cache_key *key, int rcode, int ttl, int speed, int timeout, int update_time,
 					  struct dns_cache_data *cache_data);
 
-int dns_cache_replace_inactive(struct dns_cache_key *key, int ttl, int speed, int no_inactive,
-							   struct dns_cache_data *cache_data);
-
-int dns_cache_insert(struct dns_cache_key *key, int ttl, int speed, int no_inactive, struct dns_cache_data *cache_data);
+int dns_cache_insert(struct dns_cache_key *key, int rcode, int ttl, int speed, int timeout,
+					 struct dns_cache_data *cache_data);
 
 struct dns_cache *dns_cache_lookup(struct dns_cache_key *key);
+
+int dns_cache_total_num(void);
+
+long dns_cache_total_memsize(void);
+
+int dns_cache_update_timer(struct dns_cache_key *key, int timeout);
 
 void dns_cache_delete(struct dns_cache *dns_cache);
 
@@ -162,31 +160,23 @@ int dns_cache_is_visited(struct dns_cache *dns_cache);
 
 void dns_cache_update(struct dns_cache *dns_cache);
 
-typedef void dns_cache_callback(struct dns_cache *dns_cache);
-
-void dns_cache_invalidate(dns_cache_callback precallback, int ttl_pre, unsigned int max_callback_num,
-						  dns_cache_callback inactive_precallback, int ttl_inactive_pre);
-
 int dns_cache_get_ttl(struct dns_cache *dns_cache);
-
-int dns_cache_get_cname_ttl(struct dns_cache *dns_cache);
-
-int dns_cache_is_soa(struct dns_cache *dns_cache);
-
-struct dns_cache_data *dns_cache_new_data_addr(void);
 
 struct dns_cache_data *dns_cache_get_data(struct dns_cache *dns_cache);
 
-void dns_cache_set_data_addr(struct dns_cache_data *dns_cache, char *cname, int cname_ttl, unsigned char *addr,
-							 int addr_len);
+void dns_cache_data_get(struct dns_cache_data *cache_data);
 
-void dns_cache_set_data_soa(struct dns_cache_data *dns_cache, char *cname, int cname_ttl);
+void dns_cache_data_put(struct dns_cache_data *cache_data);
+
+void dns_cache_flush(void);
 
 void dns_cache_destroy(void);
 
 int dns_cache_load(const char *file);
 
 int dns_cache_save(const char *file, int check_lock);
+
+int dns_cache_print(const char *file);
 
 const char *dns_cache_file_version(void);
 

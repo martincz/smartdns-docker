@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2023 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -69,6 +69,8 @@ class Client
 
 	std::vector<DNSRecord> GetAdditional();
 
+	std::vector<std::string> GetOpt();
+
 	int GetAnswerNum();
 
 	int GetAuthorityNum();
@@ -103,6 +105,7 @@ class Client
 	std::vector<DNSRecord> records_answer_;
 	std::vector<DNSRecord> records_authority_;
 	std::vector<DNSRecord> records_additional_;
+	std::vector<std::string> records_opt_;
 };
 
 } // namespace smartdns

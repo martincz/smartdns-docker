@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2023 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -557,10 +557,6 @@ int nftset_add(const char *familyname, const char *tablename, const char *setnam
 	int buffer_len = 0;
 	int ret = -1;
 	int nffamily = _nftset_get_nffamily_from_str(familyname);
-
-	if (dns_conf_nftset_timeout_enable == 0) {
-		timeout = 0;
-	}
 
 	ret = _nftset_get_flags(nffamily, tablename, setname, &flags);
 	if (ret == 0) {
