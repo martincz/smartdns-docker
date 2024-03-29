@@ -24,12 +24,12 @@ Use the following command to create a new container and run SmartDNS:
     docker run --name smartdns\
         --restart unless-stopped\
         -v /opt/docker/smartdns:/etc/smartdns
-        -p 1053:53/tcp -p 1053:53/udp\
+        -p 6153:6153/udp -p 6253:6253/udp\
         -d chihpengkao/smartdns
 
 Ports mappings you may need:
 
-* `-p 53:53/tcp -p 53:53/udp` : plain DNS.
+* `-p 6153:6153/udp -p 6253:6253/udp` : plain DNS.
 
 **Control the container**
 
