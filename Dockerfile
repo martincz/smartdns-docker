@@ -6,7 +6,7 @@ LABEL maintainer="Martincz Gao <martincz@mokeedev.com>"
 ENV TZ=Asia/Shanghai
 
 # prepare builder
-ARG OPENSSL_VER=3.0.10
+ARG OPENSSL_VER=3.0.16
 RUN apt update && \
     apt install -y binutils perl curl make musl-tools musl-dev && \
     ln -s /usr/include/linux /usr/include/$(uname -m)-linux-musl && \
@@ -15,7 +15,7 @@ RUN apt update && \
     \
     mkdir -p /build/openssl && \
     cd /build/openssl && \
-    curl -sSL http://archive.ubuntu.com/ubuntu/pool/main/o/openssl/openssl_${OPENSSL_VER}.orig.tar.gz | tar --strip-components=1 -zxv && \
+    curl -sSL https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VER}/openssl-${OPENSSL_VER}.tar.gz | tar --strip-components=1 -zxv && \
     \
     export CC=musl-gcc && \
     if [ "$(uname -m)" = "aarch64" ]; then \
