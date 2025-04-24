@@ -72,6 +72,7 @@ struct dns_server_info;
 #define DNS_CLIENT_ACTION_UNDEFINE (-1)
 #define DNS_CLIENT_ACTION_DROP (-2)
 #define DNS_CLIENT_ACTION_RETRY (-3)
+#define DNS_CLIENT_ACTION_MAY_RETRY (-4)
 typedef int (*dns_client_callback)(const char *domain, dns_result_type rtype, struct dns_server_info *server_info,
 								   struct dns_packet *packet, unsigned char *inpacket, int inpacket_len,
 								   void *user_ptr);
@@ -107,6 +108,7 @@ struct client_dns_server_flag_udp {
 };
 
 struct client_dns_server_flag_mdns {
+	int padding;
 };
 
 struct client_dns_server_flag_tls {
@@ -139,9 +141,13 @@ struct client_dns_server_flags {
 	unsigned int server_flag;
 	unsigned int result_flag;
 	long long set_mark;
+	int tcp_keepalive;
 	int drop_packet_latency_ms;
+
 	char proxyname[DNS_MAX_CNAME_LEN];
 	char ifname[DNS_SERVER_IFNAME_LEN];
+
+	int subnet_all_query_types;
 	struct client_dns_server_flag_ecs ipv4_ecs;
 	struct client_dns_server_flag_ecs ipv6_ecs;
 

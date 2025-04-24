@@ -91,6 +91,7 @@
 #define RECV_ERROR_FAIL (-1)
 #define RECV_ERROR_CLOSE (-2)
 #define RECV_ERROR_INVALID_PACKET (-3)
+#define RECV_ERROR_BAD_PATH (-4)
 
 typedef enum {
 	DNS_CONN_TYPE_UDP_SERVER = 0,
@@ -625,7 +626,7 @@ static int _dns_server_is_dns64_request(struct dns_request *request)
 		return 0;
 	}
 
-	if (dns_conf_dns_dns64.prefix_len <= 0) {
+	if (request->conf->dns_dns64.prefix_len <= 0) {
 		return 0;
 	}
 
@@ -946,9 +947,10 @@ static void _dns_server_audit_log(struct dns_server_post_context *context)
 				 tm.min, tm.sec, tm.usec / 1000);
 	}
 
-	tlog_printf(dns_audit, "%s%s query %s, type %d, time %lums, speed: %.1fms, result %s\n", req_time, req_host,
-				request->domain, request->qtype, get_tick_count() - request->send_tick,
-				((float)request->ping_time) / 10, req_result);
+	tlog_printf(dns_audit, "%s%s query %s, type %d, time %lums, speed: %.1fms, group %s, result %s\n", req_time,
+				req_host, request->domain, request->qtype, get_tick_count() - request->send_tick,
+				((float)request->ping_time) / 10,
+				request->dns_group_name[0] != '\0' ? request->dns_group_name : DNS_SERVER_GROUP_DEFAULT, req_result);
 }
 
 static void _dns_rrs_result_log(struct dns_server_post_context *context, struct dns_ip_address *addr_map)
@@ -2389,7 +2391,7 @@ static int _dns_request_post(struct dns_server_post_context *context)
 
 	tlog(TLOG_INFO, "result: %s, client: %s, qtype: %d, id: %d, group: %s, time: %lums", request->domain,
 		 get_host_by_addr(clientip, sizeof(clientip), (struct sockaddr *)&request->addr), request->qtype, request->id,
-		 request->dns_group_name[0] != '\0' ? request->dns_group_name : "default",
+		 request->dns_group_name[0] != '\0' ? request->dns_group_name : DNS_SERVER_GROUP_DEFAULT,
 		 get_tick_count() - request->send_tick);
 
 	ret = _dns_reply_inpacket(request, context->inpacket, context->inpacket_len);
@@ -2621,6 +2623,10 @@ static int _dns_server_request_complete_with_all_IPs(struct dns_request *request
 				 request->ip_addr[5], request->ip_addr[6], request->ip_addr[7], request->ip_addr[8],
 				 request->ip_addr[9], request->ip_addr[10], request->ip_addr[11], request->ip_addr[12],
 				 request->ip_addr[13], request->ip_addr[14], request->ip_addr[15]);
+		}
+
+		if (request->rcode == DNS_RC_SERVFAIL && request->has_ip) {
+			request->rcode = DNS_RC_NOERROR;
 		}
 	}
 
@@ -3123,10 +3129,10 @@ static void _dns_server_ping_result(struct ping_host_struct *ping_host, const ch
 			return;
 		}
 
-		if (is_ipv6_ready) {
-			if (error == EADDRNOTAVAIL || errno == EACCES) {
+		if (is_ipv6_ready == 1 && (error == EADDRNOTAVAIL || errno == EACCES)) {
+			if (is_private_addr_sockaddr(addr, addr_len) == 0) {
 				is_ipv6_ready = 0;
-				tlog(TLOG_ERROR, "IPV6 is not ready, disable all ipv6 feature, recheck after %ds",
+				tlog(TLOG_WARN, "IPV6 is not ready, disable all ipv6 feature, recheck after %ds",
 					 IPV6_READY_CHECK_TIME);
 			}
 		}
@@ -3577,26 +3583,29 @@ static int _dns_server_ip_rule_check(struct dns_request *request, struct dns_ip_
 		goto rule_not_found;
 	}
 
-	rule_flags = container_of(ip_rules->rules[IP_RULE_FLAGS], struct ip_rule_flags, head);
-	if (rule_flags != NULL) {
-		if (rule_flags->flags & IP_RULE_FLAG_BOGUS) {
-			request->rcode = DNS_RC_NXDOMAIN;
-			request->has_soa = 1;
-			request->force_soa = 1;
-			_dns_server_setup_soa(request);
-			goto nxdomain;
-		}
-
-		/* blacklist-ip */
-		if (rule_flags->flags & IP_RULE_FLAG_BLACKLIST) {
-			if (result_flag & DNSSERVER_FLAG_BLACKLIST_IP) {
-				goto match;
+	struct dns_ip_rule *rule = ip_rules->rules[IP_RULE_FLAGS];
+	if (rule != NULL) {
+		rule_flags = container_of(rule, struct ip_rule_flags, head);
+		if (rule_flags != NULL) {
+			if (rule_flags->flags & IP_RULE_FLAG_BOGUS) {
+				request->rcode = DNS_RC_NXDOMAIN;
+				request->has_soa = 1;
+				request->force_soa = 1;
+				_dns_server_setup_soa(request);
+				goto nxdomain;
 			}
-		}
 
-		/* ignore-ip */
-		if (rule_flags->flags & IP_RULE_FLAG_IP_IGNORE) {
-			goto skip;
+			/* blacklist-ip */
+			if (rule_flags->flags & IP_RULE_FLAG_BLACKLIST) {
+				if (result_flag & DNSSERVER_FLAG_BLACKLIST_IP) {
+					goto match;
+				}
+			}
+
+			/* ignore-ip */
+			if (rule_flags->flags & IP_RULE_FLAG_IP_IGNORE) {
+				goto skip;
+			}
 		}
 	}
 
@@ -3755,7 +3764,8 @@ static int _dns_server_process_answer_A_IP(struct dns_request *request, char *cn
 
 		/* add this ip to request */
 		if (_dns_ip_address_check_add(request, cname, paddr, DNS_T_A, 0, NULL) != 0) {
-			return -1;
+			/* skip result */
+			return -2;
 		}
 
 		snprintf(ip, sizeof(ip), "%d.%d.%d.%d", paddr[0], paddr[1], paddr[2], paddr[3]);
@@ -3824,7 +3834,8 @@ static int _dns_server_process_answer_AAAA_IP(struct dns_request *request, char 
 
 		/* add this ip to request */
 		if (_dns_ip_address_check_add(request, cname, paddr, DNS_T_AAAA, 0, NULL) != 0) {
-			return -1;
+			/* skip result */
+			return -2;
 		}
 
 		snprintf(ip, sizeof(ip), "[%.2x%.2x:%.2x%.2x:%.2x%.2x:%.2x%.2x:%.2x%.2x:%.2x%.2x:%.2x%.2x:%.2x%.2x]", paddr[0],
@@ -4033,6 +4044,7 @@ static int _dns_server_process_answer(struct dns_request *request, const char *d
 	int ret = 0;
 	int is_skip = 0;
 	int has_result = 0;
+	int is_rcode_set = 0;
 
 	if (packet->head.rcode != DNS_RC_NOERROR && packet->head.rcode != DNS_RC_NXDOMAIN) {
 		if (request->rcode == DNS_RC_SERVFAIL) {
@@ -4087,6 +4099,7 @@ static int _dns_server_process_answer(struct dns_request *request, const char *d
 					return -1;
 				}
 				request->rcode = packet->head.rcode;
+				is_rcode_set = 1;
 			} break;
 			case DNS_T_AAAA: {
 				ret = _dns_server_process_answer_AAAA(rrs, request, domain, cname, result_flag);
@@ -4099,6 +4112,7 @@ static int _dns_server_process_answer(struct dns_request *request, const char *d
 					return -1;
 				}
 				request->rcode = packet->head.rcode;
+				is_rcode_set = 1;
 			} break;
 			case DNS_T_NS: {
 				char nsname[DNS_MAX_CNAME_LEN];
@@ -4122,9 +4136,11 @@ static int _dns_server_process_answer(struct dns_request *request, const char *d
 				if (ret == -1) {
 					break;
 				} else if (ret == -2) {
+					is_skip = 1;
 					continue;
 				}
 				request->rcode = packet->head.rcode;
+				is_rcode_set = 1;
 				if (request->has_ip == 0) {
 					request->passthrough = 1;
 					_dns_server_request_complete(request);
@@ -4133,12 +4149,16 @@ static int _dns_server_process_answer(struct dns_request *request, const char *d
 			case DNS_T_SOA: {
 				/* if DNS64 enabled, skip check SOA. */
 				if (_dns_server_is_dns64_request(request)) {
+					if (request->has_ip) {
+						_dns_server_request_complete(request);
+					}
 					break;
 				}
 
 				request->has_soa = 1;
 				if (request->rcode != DNS_RC_NOERROR) {
 					request->rcode = packet->head.rcode;
+					is_rcode_set = 1;
 				}
 				dns_get_SOA(rrs, name, 128, &ttl, &request->soa);
 				tlog(TLOG_DEBUG,
@@ -4168,10 +4188,16 @@ static int _dns_server_process_answer(struct dns_request *request, const char *d
 		request->rcode = packet->head.rcode;
 	}
 
-	if (has_result == 0 && request->rcode == DNS_RC_NOERROR && packet->head.tc == 1) {
+	if (has_result == 0 && request->rcode == DNS_RC_NOERROR && packet->head.tc == 1 && request->has_ip == 0 &&
+		request->has_soa == 0) {
 		tlog(TLOG_DEBUG, "result is truncated, %s qtype: %d, rcode: %d, id: %d, retry.", domain, request->qtype,
 			 packet->head.rcode, packet->head.id);
 		return DNS_CLIENT_ACTION_RETRY;
+	}
+
+	if (is_rcode_set == 0 && has_result == 1 && is_skip == 0) {
+		/* need retry for some server. */
+		return DNS_CLIENT_ACTION_MAY_RETRY;
 	}
 
 	return DNS_CLIENT_ACTION_OK;
@@ -4351,7 +4377,10 @@ static int _dns_server_get_answer(struct dns_server_post_context *context)
 					continue;
 				}
 
-				_dns_server_context_add_ip(context, addr_map->ip_addr);
+				if (addr_map != NULL) {
+					_dns_server_context_add_ip(context, addr_map->ip_addr);
+				}
+
 				if (request->has_ip == 1) {
 					continue;
 				}
@@ -4383,7 +4412,10 @@ static int _dns_server_get_answer(struct dns_server_post_context *context)
 					continue;
 				}
 
-				_dns_server_context_add_ip(context, addr_map->ip_addr);
+				if (addr_map != NULL) {
+					_dns_server_context_add_ip(context, addr_map->ip_addr);
+				}
+
 				if (request->has_ip == 1) {
 					continue;
 				}
@@ -4477,7 +4509,7 @@ static int _dns_server_reply_passthrough(struct dns_server_post_context *context
 
 		tlog(TLOG_INFO, "result: %s, client: %s, qtype: %d, id: %d, group: %s, time: %lums", request->domain,
 			 get_host_by_addr(clientip, sizeof(clientip), (struct sockaddr *)&request->addr), request->qtype,
-			 request->id, request->dns_group_name[0] != '\0' ? request->dns_group_name : "default",
+			 request->id, request->dns_group_name[0] != '\0' ? request->dns_group_name : DNS_SERVER_GROUP_DEFAULT,
 			 get_tick_count() - request->send_tick);
 	}
 
@@ -4508,7 +4540,7 @@ static void _dns_server_query_end(struct dns_request *request)
 		if (request->dualstack_selection_query == 1) {
 			if ((conf->ipset_nftset.ipset_no_speed.ipv4_enable || conf->ipset_nftset.nftset_no_speed.ip_enable ||
 				 conf->ipset_nftset.ipset_no_speed.ipv6_enable || conf->ipset_nftset.nftset_no_speed.ip6_enable) &&
-				dns_conf_dns_dns64.prefix_len == 0) {
+				request->conf->dns_dns64.prefix_len == 0) {
 				/* if speed check fail enabled, we need reply quickly, otherwise wait for ping result.*/
 				_dns_server_request_complete(request);
 			}
@@ -5053,6 +5085,7 @@ static int _dns_server_process_local_ptr(struct dns_request *request)
 	prefix_t prefix;
 	radix_node_t *node = NULL;
 	struct local_addr_cache_item *addr_cache_item = NULL;
+	struct dns_nameserver_rule *ptr_nameserver_rule;
 
 	if (_dns_server_parser_addr_from_apra(request->domain, ptr_addr, &ptr_addr_len, sizeof(ptr_addr)) != 0) {
 		/* Determine if the smartdns service is in effect. */
@@ -5092,6 +5125,11 @@ static int _dns_server_process_local_ptr(struct dns_request *request)
 	}
 
 out:
+	ptr_nameserver_rule = _dns_server_get_dns_rule(request, DOMAIN_RULE_NAMESERVER);
+	if (ptr_nameserver_rule != NULL && ptr_nameserver_rule->group_name[0] != 0) {
+		goto errout;
+	}
+
 	if (found == 0 && _dns_server_is_private_address(ptr_addr, ptr_addr_len) == 0) {
 		request->has_soa = 1;
 		_dns_server_setup_soa(request);
@@ -5919,6 +5957,14 @@ static int _dns_server_process_cname(struct dns_request *request)
 		check_request = check_request->parent_request;
 	}
 
+	/* query cname domain  */
+	if (child_request->has_cname_loop == 1 && strncasecmp(request->domain, cname->cname, DNS_MAX_CNAME_LEN) == 0) {
+		request->has_cname_loop = 0;
+		request->domain_rule.rules[DOMAIN_RULE_CNAME] = NULL;
+		tlog(TLOG_DEBUG, "query cname domain %s", request->domain);
+		goto out;
+	}
+
 	child_group_name = _dns_server_get_request_server_groupname(child_request);
 	if (child_group_name) {
 		/* reset dns group and setup child request domain group again when do query.*/
@@ -5937,13 +5983,21 @@ static int _dns_server_process_cname(struct dns_request *request)
 	return 1;
 
 errout:
-
 	if (child_request) {
 		request->child_request = NULL;
 		_dns_server_request_release(child_request);
 	}
 
 	return -1;
+
+out:
+	if (child_request) {
+		child_request->parent_request = NULL;
+		request->child_request = NULL;
+		_dns_server_request_release(child_request);
+		_dns_server_request_release(request);
+	}
+	return 0;
 }
 
 static enum DNS_CHILD_POST_RESULT
@@ -5956,7 +6010,7 @@ _dns_server_process_dns64_callback(struct dns_request *request, struct dns_reque
 	int addr_len = 0;
 
 	if (request->has_ip == 1) {
-		if (memcmp(request->ip_addr, dns_conf_dns_dns64.prefix, 12) != 0) {
+		if (memcmp(request->ip_addr, request->conf->dns_dns64.prefix, 12) != 0) {
 			return DNS_CHILD_POST_SKIP;
 		}
 	}
@@ -5971,11 +6025,12 @@ _dns_server_process_dns64_callback(struct dns_request *request, struct dns_reque
 		request->ttl_cname = child_request->ttl_cname;
 	}
 
-	if (child_request->has_ip == 0) {
+	if (child_request->has_ip == 0 && request->has_ip == 0) {
+		request->rcode = child_request->rcode;
 		if (child_request->has_soa) {
 			memcpy(&request->soa, &child_request->soa, sizeof(struct dns_soa));
 			request->has_soa = 1;
-			return DNS_CHILD_POST_SUCCESS;
+			return DNS_CHILD_POST_SKIP;
 		}
 
 		if (request->has_soa == 0) {
@@ -5985,13 +6040,15 @@ _dns_server_process_dns64_callback(struct dns_request *request, struct dns_reque
 		return DNS_CHILD_POST_FAIL;
 	}
 
-	memcpy(request->ip_addr, dns_conf_dns_dns64.prefix, 16);
-	memcpy(request->ip_addr + 12, child_request->ip_addr, 4);
-	request->ip_ttl = child_request->ip_ttl;
-	request->has_ip = 1;
-	request->has_soa = 0;
+	if (request->has_ip == 0 && child_request->has_ip == 1) {
+		request->rcode = child_request->rcode;
+		memcpy(request->ip_addr, request->conf->dns_dns64.prefix, 12);
+		memcpy(request->ip_addr + 12, child_request->ip_addr, 4);
+		request->ip_ttl = child_request->ip_ttl;
+		request->has_ip = 1;
+		request->has_soa = 0;
+	}
 
-	request->rcode = child_request->rcode;
 	pthread_mutex_lock(&request->ip_map_lock);
 	hash_for_each_safe(request->ip_map, bucket, tmp, addr_map, node)
 	{
@@ -6021,7 +6078,7 @@ _dns_server_process_dns64_callback(struct dns_request *request, struct dns_reque
 
 		new_addr_map->addr_type = DNS_T_AAAA;
 		addr_len = DNS_RR_AAAA_LEN;
-		memcpy(new_addr_map->ip_addr, dns_conf_dns_dns64.prefix, 16);
+		memcpy(new_addr_map->ip_addr, request->conf->dns_dns64.prefix, 16);
 		memcpy(new_addr_map->ip_addr + 12, addr_map->ip_addr, 4);
 
 		new_addr_map->ping_time = addr_map->ping_time;
@@ -6037,7 +6094,7 @@ _dns_server_process_dns64_callback(struct dns_request *request, struct dns_reque
 		return DNS_CHILD_POST_NO_RESPONSE;
 	}
 
-	return DNS_CHILD_POST_SUCCESS;
+	return DNS_CHILD_POST_SKIP;
 }
 
 static int _dns_server_process_dns64(struct dns_request *request)
@@ -6055,6 +6112,8 @@ static int _dns_server_process_dns64(struct dns_request *request)
 		return -1;
 	}
 
+	request->dualstack_selection = 0;
+	child_request->prefetch_flags |= PREFETCH_FLAGS_NO_DUALSTACK;
 	request->request_wait++;
 	int ret = _dns_server_do_query(child_request, 0);
 	if (ret != 0) {
@@ -6064,7 +6123,7 @@ static int _dns_server_process_dns64(struct dns_request *request)
 	}
 
 	_dns_server_request_release_complete(child_request, 0);
-	return 1;
+	return 0;
 
 errout:
 
@@ -6280,6 +6339,10 @@ static int _dns_server_process_cache(struct dns_request *request)
 		} else if (request->qtype == DNS_T_AAAA) {
 			dualstack_qtype = DNS_T_A;
 		} else {
+			goto reply_cache;
+		}
+
+		if (_dns_server_is_dns64_request(request) == 1) {
 			goto reply_cache;
 		}
 
@@ -6679,6 +6742,7 @@ static void _dns_server_mdns_query_setup_server_group(struct dns_request *reques
 	}
 
 	*group_name = DNS_SERVER_GROUP_MDNS;
+	safe_strncpy(request->dns_group_name, *group_name, sizeof(request->dns_group_name));
 	return;
 }
 
@@ -6820,18 +6884,35 @@ static int _dns_server_setup_request_conf(struct dns_request *request)
 	return 0;
 }
 
+static void _dns_server_setup_dns_group_name(struct dns_request *request, const char **server_group_name)
+{
+	const char *group_name = NULL;
+	const char *temp_group_name = NULL;
+	if (request->conn) {
+		group_name = request->conn->dns_group;
+	}
+
+	temp_group_name = _dns_server_get_request_server_groupname(request);
+	if (temp_group_name != NULL) {
+		group_name = temp_group_name;
+	}
+
+	if (request->dns_group_name[0] != '\0' && group_name == NULL) {
+		group_name = request->dns_group_name;
+	} else {
+		safe_strncpy(request->dns_group_name, group_name, sizeof(request->dns_group_name));
+	}
+
+	*server_group_name = group_name;
+}
+
 static int _dns_server_do_query(struct dns_request *request, int skip_notify_event)
 {
 	int ret = -1;
 	const char *server_group_name = NULL;
-	const char *dns_group = NULL;
 	struct dns_query_options options;
 	char *request_domain = request->domain;
 	char domain_buffer[DNS_MAX_CNAME_LEN * 2];
-
-	if (request->conn) {
-		dns_group = request->conn->dns_group;
-	}
 
 	request->send_tick = get_tick_count();
 
@@ -6842,16 +6923,7 @@ static int _dns_server_do_query(struct dns_request *request, int skip_notify_eve
 	/* lookup domain rule */
 	_dns_server_get_domain_rule(request);
 
-	if (request->dns_group_name[0] == '\0') {
-		if (dns_group) {
-			safe_strncpy(request->dns_group_name, dns_group, sizeof(request->dns_group_name));
-		}
-	}
-
-	server_group_name = _dns_server_get_request_server_groupname(request);
-	if (server_group_name == NULL) {
-		server_group_name = request->dns_group_name;
-	}
+	_dns_server_setup_dns_group_name(request, &server_group_name);
 
 	if (_dns_server_setup_request_conf(request) != 0) {
 		goto errout;
@@ -6909,16 +6981,17 @@ static int _dns_server_do_query(struct dns_request *request, int skip_notify_eve
 	/* check and set passthrough */
 	_dns_server_check_set_passthrough(request);
 
-	/* process cache */
-	if (request->prefetch == 0 && request->dualstack_selection_query == 0) {
-		if (_dns_server_process_cache(request) == 0) {
-			goto clean_exit;
-		}
-	}
-
 	/* process ptr */
 	if (_dns_server_process_ptr_query(request) == 0) {
 		goto clean_exit;
+	}
+
+	/* process cache */
+	if (request->prefetch == 0 && request->dualstack_selection_query == 0) {
+		_dns_server_mdns_query_setup_server_group(request, &server_group_name);
+		if (_dns_server_process_cache(request) == 0) {
+			goto clean_exit;
+		}
 	}
 
 	ret = _dns_server_set_to_pending_list(request);
@@ -7759,6 +7832,7 @@ static int _dns_server_tcp_process_one_request(struct dns_server_conn_tcp_client
 	int len = 0;
 	struct http_head *http_head = NULL;
 	uint8_t *http_decode_data = NULL;
+	char *base64_query = NULL;
 
 	/* Handling multiple requests */
 	for (;;) {
@@ -7802,13 +7876,27 @@ static int _dns_server_tcp_process_one_request(struct dns_server_conn_tcp_client
 			} else if (http_head_get_method(http_head) == HTTP_METHOD_GET) {
 				const char *path = http_head_get_url(http_head);
 				if (path == NULL || strncasecmp(path, "/dns-query", sizeof("/dns-query")) != 0) {
+					ret = RECV_ERROR_BAD_PATH;
 					tlog(TLOG_DEBUG, "path not supported, %s", path);
 					goto errout;
 				}
 
-				const char *base64_query = http_head_get_params_value(http_head, "dns");
-				if (base64_query == NULL) {
+				const char *dns_query = http_head_get_params_value(http_head, "dns");
+				if (dns_query == NULL) {
 					tlog(TLOG_DEBUG, "query is null.");
+					goto errout;
+				}
+
+				if (base64_query == NULL) {
+					base64_query = malloc(DNS_IN_PACKSIZE);
+					if (base64_query == NULL) {
+						tlog(TLOG_DEBUG, "malloc failed.");
+						goto errout;
+					}
+				}
+
+				if (urldecode(base64_query, DNS_IN_PACKSIZE, dns_query) < 0) {
+					tlog(TLOG_DEBUG, "urldecode query failed.");
 					goto errout;
 				}
 
@@ -7820,7 +7908,7 @@ static int _dns_server_tcp_process_one_request(struct dns_server_conn_tcp_client
 					}
 				}
 
-				int decode_len = SSL_base64_decode(base64_query, http_decode_data, DNS_IN_PACKSIZE);
+				int decode_len = SSL_base64_decode_ext(base64_query, http_decode_data, DNS_IN_PACKSIZE, 1, 1);
 				if (decode_len <= 0) {
 					tlog(TLOG_DEBUG, "decode query failed.");
 					goto errout;
@@ -7887,9 +7975,16 @@ errout:
 		free(http_decode_data);
 	}
 
-	if ((ret == RECV_ERROR_FAIL || ret == RECV_ERROR_INVALID_PACKET) &&
-		tcpclient->head.type == DNS_CONN_TYPE_HTTPS_CLIENT) {
-		_dns_server_reply_http_error(tcpclient, 400, "Bad Request", "Bad Request");
+	if (base64_query) {
+		free(base64_query);
+	}
+
+	if (tcpclient->head.type == DNS_CONN_TYPE_HTTPS_CLIENT) {
+		if (ret == RECV_ERROR_BAD_PATH) {
+			_dns_server_reply_http_error(tcpclient, 404, "Not Found", "Not Found");
+		} else if (ret == RECV_ERROR_FAIL || ret == RECV_ERROR_INVALID_PACKET) {
+			_dns_server_reply_http_error(tcpclient, 400, "Bad Request", "Bad Request");
+		}
 	}
 
 	return ret;
@@ -8683,7 +8778,7 @@ static int _dns_create_socket(const char *host_ip, int type)
 	snprintf(port_str, sizeof(port_str), "%d", port);
 	gai = _dns_server_getaddr(host, port_str, type, 0);
 	if (gai == NULL) {
-		tlog(TLOG_ERROR, "get address failed.\n");
+		tlog(TLOG_ERROR, "get address failed.");
 		goto errout;
 	}
 
@@ -8749,6 +8844,8 @@ errout:
 	if (gai) {
 		freeaddrinfo(gai);
 	}
+
+	tlog(TLOG_ERROR, "add server failed, host-ip: %s, type: %d", host_ip, type);
 	return -1;
 }
 
@@ -8949,6 +9046,8 @@ static int _dns_server_socket(void)
 
 	for (i = 0; i < dns_conf_bind_ip_num; i++) {
 		struct dns_bind_ip *bind_ip = &dns_conf_bind_ip[i];
+		tlog(TLOG_INFO, "bind ip %s, type %d", bind_ip->ip, bind_ip->type);
+
 		switch (bind_ip->type) {
 		case DNS_BIND_TYPE_UDP:
 			if (_dns_server_socket_udp(bind_ip) != 0) {
@@ -9240,6 +9339,8 @@ int dns_server_init(void)
 	INIT_LIST_HEAD(&server.conn_list);
 	time(&server.cache_save_time);
 	atomic_set(&server.request_num, 0);
+	pthread_mutex_init(&server.request_list_lock, NULL);
+	INIT_LIST_HEAD(&server.request_list);
 
 	epollfd = epoll_create1(EPOLL_CLOEXEC);
 	if (epollfd < 0) {
@@ -9253,8 +9354,6 @@ int dns_server_init(void)
 		goto errout;
 	}
 
-	pthread_mutex_init(&server.request_list_lock, NULL);
-	INIT_LIST_HEAD(&server.request_list);
 	server.epoll_fd = epollfd;
 	atomic_set(&server.run, 1);
 

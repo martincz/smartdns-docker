@@ -58,6 +58,12 @@ unsigned long get_tick_count(void);
 
 char *dir_name(char *path);
 
+int get_uid_gid(uid_t *uid, gid_t *gid);
+
+int drop_root_privilege(void);
+
+int create_dir_with_perm(const char *dir_path);
+
 char *get_host_by_addr(char *host, int maxsize, struct sockaddr *addr);
 
 int generate_random_addr(unsigned char *addr, int addr_len, int mask);
@@ -66,6 +72,8 @@ int generate_addr_map(const unsigned char *addr_from, const unsigned char *addr_
 					  int addr_len, int mask);
 
 int is_private_addr(const unsigned char *addr, int addr_len);
+
+int is_private_addr_sockaddr(struct sockaddr *addr, socklen_t addr_len);
 
 int getaddr_by_host(const char *host, struct sockaddr *addr, socklen_t *addr_len);
 
@@ -89,7 +97,7 @@ int parse_uri(const char *value, char *scheme, char *host, int *port, char *path
 
 int parse_uri_ext(const char *value, char *scheme, char *user, char *password, char *host, int *port, char *path);
 
-void urldecode(char *dst, const char *src);
+int urldecode(char *dst, int dst_maxlen, const char *src);
 
 int set_fd_nonblock(int fd, int nonblock);
 
@@ -114,6 +122,8 @@ void SSL_CRYPTO_thread_cleanup(void);
 unsigned char *SSL_SHA256(const unsigned char *d, size_t n, unsigned char *md);
 
 int SSL_base64_decode(const char *in, unsigned char *out, int max_outlen);
+
+int SSL_base64_decode_ext(const char *in, unsigned char *out, int max_outlen, int url_safe, int auto_padding);
 
 int SSL_base64_encode(const void *in, int in_len, char *out);
 
@@ -178,6 +188,8 @@ int daemon_keepalive(void);
 void daemon_close_stdfds(void);
 
 int write_file(const char *filename, void *data, int data_len);
+
+int set_http_host(const char *uri_host, int port, int default_port, char *host);
 
 int dns_packet_save(const char *dir, const char *type, const char *from, const void *packet, int packet_len);
 

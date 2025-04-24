@@ -61,9 +61,6 @@ static time_t dns_conf_dnsmasq_lease_file_time;
 struct dns_hosts_table dns_hosts_table;
 int dns_hosts_record_num;
 
-/* DNS64 */
-struct dns_dns64 dns_conf_dns_dns64;
-
 /* SRV-HOST */
 struct dns_srv_record_table dns_conf_srv_record_table;
 
@@ -95,7 +92,7 @@ struct dns_servers dns_conf_servers[DNS_MAX_SERVERS];
 char dns_conf_server_name[DNS_MAX_SERVER_NAME_LEN];
 int dns_conf_server_num;
 static int dns_conf_resolv_hostname = 1;
-static char dns_conf_exist_bootstrap_dns;
+char dns_conf_exist_bootstrap_dns;
 
 int dns_conf_has_icmp_check;
 int dns_conf_has_tcp_check;
@@ -108,6 +105,7 @@ struct dns_domain_check_orders dns_conf_default_check_orders = {
 		},
 };
 static int dns_has_cap_ping = 0;
+int dns_ping_cap_force_enable = 0;
 
 /* logging */
 int dns_conf_log_level = TLOG_ERROR;
@@ -912,6 +910,7 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 	unsigned int server_flag = 0;
 	unsigned char *spki = NULL;
 	int drop_packet_latency_ms = 0;
+	int tcp_keepalive = -1;
 	int is_bootstrap_dns = 0;
 	char host_ip[DNS_MAX_IPLEN] = {0};
 	int no_tls_host_name = 0;
@@ -942,6 +941,8 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 		{"host-name", required_argument, NULL, 260}, /* host name */
 		{"http-host", required_argument, NULL, 261}, /* http host */
 		{"tls-host-verify", required_argument, NULL, 262 }, /* verify tls hostname */
+		{"tcp-keepalive", required_argument, NULL, 263}, /* tcp keepalive */
+		{"subnet-all-query-types", no_argument, NULL, 264}, /* send subnent for all query types.*/
 		{NULL, no_argument, NULL, 0}
 	};
 	/* clang-format on */
@@ -965,6 +966,8 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 	server->proxyname[0] = '\0';
 	server->set_mark = -1;
 	server->drop_packet_latency_ms = drop_packet_latency_ms;
+	server->tcp_keepalive = tcp_keepalive;
+	server->subnet_all_query_types = 0;
 
 	if (parse_uri(ip, scheme, server->server, &port, server->path) != 0) {
 		return -1;
@@ -1103,6 +1106,14 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 			}
 			break;
 		}
+		case 263: {
+			server->tcp_keepalive = atoi(optarg);
+			break;
+		}
+		case 264: {
+			server->subnet_all_query_types = 1;
+			break;
+		}
 		default:
 			if (optind > optind_last) {
 				tlog(TLOG_WARN, "unknown server option: %s at '%s:%d'.", argv[optind - 1], conf_get_conf_file(),
@@ -1152,7 +1163,7 @@ static int _config_server(int argc, char *argv[], dns_server_type_t type, int de
 		}
 
 		if (server->httphost[0] == '\0') {
-			safe_strncpy(server->httphost, server->server, DNS_MAX_CNAME_LEN);
+			set_http_host(server->server, server->port, DEFAULT_DNS_HTTPS_PORT, server->httphost);
 		}
 	}
 
@@ -2833,6 +2844,11 @@ static int _config_dns64(void *data, int argc, char *argv[])
 
 	subnet = argv[1];
 
+	if (strncmp(subnet, "-", 2U) == 0) {
+		memset(&_config_current_rule_group()->dns_dns64, 0, sizeof(struct dns_dns64));
+		return 0;
+	}
+
 	p = prefix_pton(subnet, -1, &prefix, &errmsg);
 	if (p == NULL) {
 		goto errout;
@@ -2848,8 +2864,9 @@ static int _config_dns64(void *data, int argc, char *argv[])
 		goto errout;
 	}
 
-	memcpy(&dns_conf_dns_dns64.prefix, &prefix.add.sin6.s6_addr, sizeof(dns_conf_dns_dns64.prefix));
-	dns_conf_dns_dns64.prefix_len = prefix.bitlen;
+	struct dns_dns64 *dns64 = &(_config_current_rule_group()->dns_dns64);
+	memcpy(&dns64->prefix, &prefix.add.sin6.s6_addr, sizeof(dns64->prefix));
+	dns64->prefix_len = prefix.bitlen;
 
 	return 0;
 
@@ -2994,13 +3011,33 @@ errout:
 	return -1;
 }
 
+static int _bind_is_ip_valid(const char *ip)
+{
+	struct sockaddr_storage addr;
+	socklen_t addr_len = sizeof(addr);
+	char ip_check[MAX_IP_LEN];
+	int port_check = -1;
+
+	if (parse_ip(ip, ip_check, &port_check) != 0) {
+		if (port_check != -1 && ip_check[0] == '\0') {
+			return 0;
+		}
+		return -1;
+	}
+
+	if (getaddr_by_host(ip_check, (struct sockaddr *)&addr, &addr_len) != 0) {
+		return -1;
+	}
+
+	return 0;
+}
+
 static int _config_bind_ip(int argc, char *argv[], DNS_BIND_TYPE type)
 {
 	int index = dns_conf_bind_ip_num;
 	struct dns_bind_ip *bind_ip = NULL;
 	char *ip = NULL;
 	int opt = 0;
-	int optind = 0;
 	int optind_last = 0;
 	char group_name[DNS_GROUP_NAME_LEN];
 	const char *group = NULL;
@@ -3030,14 +3067,19 @@ static int _config_bind_ip(int argc, char *argv[], DNS_BIND_TYPE type)
 	};
 	/* clang-format on */
 	if (argc <= 1) {
-		tlog(TLOG_ERROR, "invalid parameter.");
+		tlog(TLOG_ERROR, "bind: invalid parameter.");
 		goto errout;
 	}
 
 	ip = argv[1];
-	if (index >= DNS_MAX_SERVERS) {
+	if (index >= DNS_MAX_BIND_IP) {
 		tlog(TLOG_WARN, "exceeds max server number, %s", ip);
 		return 0;
+	}
+
+	if (_bind_is_ip_valid(ip) != 0) {
+		tlog(TLOG_ERROR, "bind ip address invalid: %s", ip);
+		return -1;
 	}
 
 	for (i = 0; i < dns_conf_bind_ip_num; i++) {
@@ -3050,7 +3092,7 @@ static int _config_bind_ip(int argc, char *argv[], DNS_BIND_TYPE type)
 			continue;
 		}
 
-		tlog(TLOG_WARN, "Bind server %s, type %d, already configured, skip.", ip, type);
+		tlog(TLOG_WARN, "bind server %s, type %d, already configured, skip.", ip, type);
 		return 0;
 	}
 
@@ -4812,7 +4854,6 @@ static int _conf_domain_rule_no_ipalias(const char *domain)
 static int _conf_domain_rules(void *data, int argc, char *argv[])
 {
 	int opt = 0;
-	int optind = 0;
 	int optind_last = 0;
 	char domain[DNS_MAX_CONF_CNAME_LEN];
 	char *value = argv[1];
@@ -6352,6 +6393,10 @@ static int _dns_ping_cap_check(void)
 		dns_has_cap_ping = 1;
 	}
 
+	if (dns_ping_cap_force_enable) {
+		dns_has_cap_ping = 1;
+	}
+
 	return 0;
 }
 
@@ -6432,6 +6477,10 @@ static void _dns_conf_group_post(void)
 
 		if ((group->dns_rr_ttl_max < group->dns_rr_ttl_min) && group->dns_rr_ttl_max > 0) {
 			group->dns_rr_ttl_max = group->dns_rr_ttl_min;
+		}
+
+		if (group->dns_serve_expired == 1 && group->dns_serve_expired_ttl == 0) {
+			group->dns_serve_expired_ttl = DNS_MAX_SERVE_EXPIRED_TIME;
 		}
 	}
 }

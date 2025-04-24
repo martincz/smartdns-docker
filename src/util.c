@@ -41,6 +41,7 @@
 #include <openssl/x509v3.h>
 #include <poll.h>
 #include <pthread.h>
+#include <pwd.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
@@ -53,7 +54,9 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef HAVE_UNWIND_BACKTRACE
 #include <unwind.h>
+#endif
 
 #define TMP_BUFF_LEN_32 32
 
@@ -128,6 +131,93 @@ unsigned long get_tick_count(void)
 	return (ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
 }
 
+int get_uid_gid(uid_t *uid, gid_t *gid)
+{
+	struct passwd *result = NULL;
+	struct passwd pwd;
+	char *buf = NULL;
+	ssize_t bufsize = 0;
+	int ret = -1;
+
+	if (dns_conf_user[0] == '\0') {
+		*uid = getuid();
+		*gid = getgid();
+		return 0;
+	}
+
+	bufsize = sysconf(_SC_GETPW_R_SIZE_MAX);
+	if (bufsize == -1) {
+		bufsize = 1024 * 16;
+	}
+
+	buf = malloc(bufsize);
+	if (buf == NULL) {
+		goto out;
+	}
+
+	ret = getpwnam_r(dns_conf_user, &pwd, buf, bufsize, &result);
+	if (ret != 0) {
+		goto out;
+	}
+
+	if (result == NULL) {
+		ret = -1;
+		goto out;
+	}
+
+	*uid = result->pw_uid;
+	*gid = result->pw_gid;
+
+out:
+	if (buf) {
+		free(buf);
+	}
+
+	return ret;
+}
+
+int capget(struct __user_cap_header_struct *header, struct __user_cap_data_struct *cap);
+int capset(struct __user_cap_header_struct *header, struct __user_cap_data_struct *cap);
+
+int drop_root_privilege(void)
+{
+	struct __user_cap_data_struct cap[2];
+	struct __user_cap_header_struct header;
+#ifdef _LINUX_CAPABILITY_VERSION_3
+	header.version = _LINUX_CAPABILITY_VERSION_3;
+#else
+	header.version = _LINUX_CAPABILITY_VERSION;
+#endif
+	header.pid = 0;
+	uid_t uid = 0;
+	gid_t gid = 0;
+	int unused __attribute__((unused)) = 0;
+
+	if (get_uid_gid(&uid, &gid) != 0) {
+		return -1;
+	}
+
+	memset(cap, 0, sizeof(cap));
+	if (capget(&header, cap) < 0) {
+		return -1;
+	}
+
+	prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0);
+	for (int i = 0; i < 2; i++) {
+		cap[i].effective = (1 << CAP_NET_RAW | 1 << CAP_NET_ADMIN | 1 << CAP_NET_BIND_SERVICE);
+		cap[i].permitted = (1 << CAP_NET_RAW | 1 << CAP_NET_ADMIN | 1 << CAP_NET_BIND_SERVICE);
+	}
+
+	unused = setgid(gid);
+	unused = setuid(uid);
+	if (capset(&header, cap) < 0) {
+		return -1;
+	}
+
+	prctl(PR_SET_KEEPCAPS, 0, 0, 0, 0);
+	return 0;
+}
+
 char *dir_name(char *path)
 {
 	if (strstr(path, "/") == NULL) {
@@ -136,6 +226,46 @@ char *dir_name(char *path)
 	}
 
 	return dirname(path);
+}
+
+int create_dir_with_perm(const char *dir_path)
+{
+	uid_t uid = 0;
+	gid_t gid = 0;
+	struct stat sb;
+	char data_dir[PATH_MAX] = {0};
+	int unused __attribute__((unused)) = 0;
+
+	safe_strncpy(data_dir, dir_path, PATH_MAX);
+	dir_name(data_dir);
+
+	if (get_uid_gid(&uid, &gid) != 0) {
+		return -1;
+	}
+
+	if (stat(data_dir, &sb) == 0) {
+		if (sb.st_uid == uid && sb.st_gid == gid && (sb.st_mode & 0700) == 0700) {
+			return 0;
+		}
+
+		if (sb.st_gid == gid && (sb.st_mode & 0070) == 0070) {
+			return 0;
+		}
+
+		if (sb.st_uid != uid && sb.st_gid != gid && (sb.st_mode & 0007) == 0007) {
+			return 0;
+		}
+	}
+
+	mkdir(data_dir, 0750);
+	if (chown(data_dir, uid, gid) != 0) {
+		return -2;
+	}
+
+	unused = chmod(data_dir, 0750);
+	unused = chown(dir_path, uid, gid);
+
+	return 0;
 }
 
 char *get_host_by_addr(char *host, int maxsize, struct sockaddr *addr)
@@ -246,6 +376,32 @@ int is_private_addr(const unsigned char *addr, int addr_len)
 	return 0;
 }
 
+int is_private_addr_sockaddr(struct sockaddr *addr, socklen_t addr_len)
+{
+	switch (addr->sa_family) {
+	case AF_INET: {
+		struct sockaddr_in *addr_in = NULL;
+		addr_in = (struct sockaddr_in *)addr;
+		return is_private_addr((const unsigned char *)&addr_in->sin_addr.s_addr, IPV4_ADDR_LEN);
+	} break;
+	case AF_INET6: {
+		struct sockaddr_in6 *addr_in6 = NULL;
+		addr_in6 = (struct sockaddr_in6 *)addr;
+		if (IN6_IS_ADDR_V4MAPPED(&addr_in6->sin6_addr)) {
+			return is_private_addr(addr_in6->sin6_addr.s6_addr + 12, IPV4_ADDR_LEN);
+		} else {
+			return is_private_addr(addr_in6->sin6_addr.s6_addr, IPV6_ADDR_LEN);
+		}
+	} break;
+	default:
+		goto errout;
+		break;
+	}
+
+errout:
+	return 0;
+}
+
 int getaddr_by_host(const char *host, struct sockaddr *addr, socklen_t *addr_len)
 {
 	struct addrinfo hints;
@@ -336,14 +492,14 @@ int getsocket_inet(int fd, struct sockaddr *addr, socklen_t *addr_len)
 	switch (addr_store.ss_family) {
 	case AF_INET: {
 		struct sockaddr_in *addr_in = NULL;
-		addr_in = (struct sockaddr_in *)addr;
+		addr_in = (struct sockaddr_in *)&addr_store;
 		addr_in->sin_family = AF_INET;
 		*addr_len = sizeof(struct sockaddr_in);
 		memcpy(addr, addr_in, sizeof(struct sockaddr_in));
 	} break;
 	case AF_INET6: {
 		struct sockaddr_in6 *addr_in6 = NULL;
-		addr_in6 = (struct sockaddr_in6 *)addr;
+		addr_in6 = (struct sockaddr_in6 *)&addr_store;
 		if (IN6_IS_ADDR_V4MAPPED(&addr_in6->sin6_addr)) {
 			struct sockaddr_in addr_in4;
 			memset(&addr_in4, 0, sizeof(addr_in4));
@@ -552,9 +708,10 @@ int parse_uri(const char *value, char *scheme, char *host, int *port, char *path
 	return parse_uri_ext(value, scheme, NULL, NULL, host, port, path);
 }
 
-void urldecode(char *dst, const char *src)
+int urldecode(char *dst, int dst_maxlen, const char *src)
 {
 	char a, b;
+	int len = 0;
 	while (*src) {
 		if ((*src == '%') && ((a = src[1]) && (b = src[2])) && (isxdigit(a) && isxdigit(b))) {
 			if (a >= 'a') {
@@ -584,8 +741,15 @@ void urldecode(char *dst, const char *src)
 		} else {
 			*dst++ = *src++;
 		}
+
+		len++;
+		if (len >= dst_maxlen - 1) {
+			return -1;
+		}
 	}
 	*dst++ = '\0';
+
+	return len;
 }
 
 int parse_uri_ext(const char *value, char *scheme, char *user, char *password, char *host, int *port, char *path)
@@ -635,11 +799,15 @@ int parse_uri_ext(const char *value, char *scheme, char *user, char *password, c
 			*sep = '\0';
 			sep = sep + 1;
 			if (password) {
-				urldecode(password, sep);
+				if (urldecode(password, 128, sep) < 0) {
+					return -1;
+				}
 			}
 		}
 		if (user) {
-			urldecode(user, user_password);
+			if (urldecode(user, 128, user_password) < 0) {
+				return -1;
+			}
 		}
 	} else {
 		host_part = user_pass_host_part;
@@ -896,15 +1064,16 @@ int netlink_get_neighbors(int family,
 			continue;
 		}
 
-		unsigned int rtalen = len;
-		for (nlh = (struct nlmsghdr *)buf; NLMSG_OK(nlh, rtalen); nlh = NLMSG_NEXT(nlh, rtalen)) {
+		uint32_t nlh_len = len;
+		for (nlh = (struct nlmsghdr *)buf; NLMSG_OK(nlh, nlh_len); nlh = NLMSG_NEXT(nlh, nlh_len)) {
 			ndm = NLMSG_DATA(nlh);
 			struct rtattr *rta = RTM_RTA(ndm);
 			const uint8_t *mac = NULL;
 			const uint8_t *net_addr = NULL;
 			int net_addr_len = 0;
+			int rta_len = RTM_PAYLOAD(nlh);
 
-			for (; RTA_OK(rta, rtalen); rta = RTA_NEXT(rta, rtalen)) {
+			for (; RTA_OK(rta, rta_len); rta = RTA_NEXT(rta, rta_len)) {
 				if (rta->rta_type == NDA_DST) {
 					if (ndm->ndm_family == AF_INET) {
 						struct in_addr *addr = RTA_DATA(rta);
@@ -976,20 +1145,59 @@ unsigned char *SSL_SHA256(const unsigned char *d, size_t n, unsigned char *md)
 	return (md);
 }
 
-int SSL_base64_decode(const char *in, unsigned char *out, int max_outlen)
+int SSL_base64_decode_ext(const char *in, unsigned char *out, int max_outlen, int url_safe, int auto_padding)
 {
 	size_t inlen = strlen(in);
+	char *in_padding_data = NULL;
+	int padding_len = 0;
+	const char *in_data = in;
 	int outlen = 0;
-
-	if (max_outlen < (int)inlen / 4 * 3) {
-		goto errout;
-	}
 
 	if (inlen == 0) {
 		return 0;
 	}
 
-	outlen = EVP_DecodeBlock(out, (unsigned char *)in, inlen);
+	if (inlen % 4 == 0) {
+		auto_padding = 0;
+	}
+
+	if (auto_padding == 1 || url_safe == 1) {
+		padding_len = 4 - inlen % 4;
+		in_padding_data = (char *)malloc(inlen + padding_len + 1);
+		if (in_padding_data == NULL) {
+			goto errout;
+		}
+
+		if (url_safe) {
+			for (size_t i = 0; i < inlen; i++) {
+				if (in[i] == '-') {
+					in_padding_data[i] = '+';
+				} else if (in[i] == '_') {
+					in_padding_data[i] = '/';
+				} else {
+					in_padding_data[i] = in[i];
+				}
+			}
+		} else {
+			memcpy(in_padding_data, in, inlen);
+		}
+
+		if (auto_padding) {
+			memset(in_padding_data + inlen, '=', padding_len);
+		} else {
+			padding_len = 0;
+		}
+
+		in_padding_data[inlen + padding_len] = '\0';
+		in_data = in_padding_data;
+		inlen += padding_len;
+	}
+
+	if (max_outlen < (int)inlen / 4 * 3) {
+		goto errout;
+	}
+
+	outlen = EVP_DecodeBlock(out, (unsigned char *)in_data, inlen);
 	if (outlen < 0) {
 		goto errout;
 	}
@@ -999,9 +1207,25 @@ int SSL_base64_decode(const char *in, unsigned char *out, int max_outlen)
 		--outlen;
 	}
 
+	if (in_padding_data) {
+		free(in_padding_data);
+	}
+
+	outlen -= padding_len;
+
 	return outlen;
 errout:
+
+	if (in_padding_data) {
+		free(in_padding_data);
+	}
+
 	return -1;
+}
+
+int SSL_base64_decode(const char *in, unsigned char *out, int max_outlen)
+{
+	return SSL_base64_decode_ext(in, out, max_outlen, 0, 0);
 }
 
 int SSL_base64_encode(const void *in, int in_len, char *out)
@@ -1596,6 +1820,8 @@ uint64_t get_free_space(const char *path)
 	return size;
 }
 
+#ifdef HAVE_UNWIND_BACKTRACE
+
 struct backtrace_state {
 	void **current;
 	void **end;
@@ -1643,6 +1869,9 @@ void print_stack(void)
 		tlog(TLOG_FATAL, "#%.2d: %p %s() from %s+%p", idx + 1, addr, symbol, info.dli_fname, offset);
 	}
 }
+#else
+void print_stack(void) {}
+#endif
 
 bool file_exists(char *file_name) {
 	if (!fopen(file_name, "r")) {
@@ -2012,6 +2241,23 @@ int parser_mac_address(const char *in_mac, uint8_t mac[6])
 	}
 
 	return -1;
+}
+
+int set_http_host(const char *uri_host, int port, int default_port, char *host)
+{
+	int is_ipv6;
+
+	if (uri_host == NULL || port <= 0 || host == NULL) {
+		return -1;
+	}
+
+	is_ipv6 = check_is_ipv6(uri_host);
+	if (port == default_port) {
+		snprintf(host, DNS_MAX_CNAME_LEN, "%s%s%s", is_ipv6 == 0 ? "[" : "", uri_host, is_ipv6 == 0 ? "]" : "");
+	} else  {
+		snprintf(host, DNS_MAX_CNAME_LEN, "%s%s%s:%d", is_ipv6 == 0 ? "[" : "", uri_host, is_ipv6 == 0 ? "]" : "", port);
+	}
+	return 0;
 }
 
 #if defined(DEBUG) || defined(TEST)
