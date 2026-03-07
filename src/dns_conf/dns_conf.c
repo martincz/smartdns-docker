@@ -17,6 +17,7 @@
  */
 
 #include "smartdns/dns_conf.h"
+#include "smartdns/lib/idna.h"
 #include "smartdns/tlog.h"
 #include "smartdns/util.h"
 
@@ -121,8 +122,20 @@ static int _dns_conf_setup_mdns(void)
 	return _conf_domain_rule_nameserver(DNS_SERVER_GROUP_LOCAL, DNS_SERVER_GROUP_MDNS);
 }
 
+static int _config_server_name(void *data, int argc, char *argv[])
+{
+	if (argc <= 1) {
+		tlog(TLOG_ERROR, "invalid parameter.");
+		return -1;
+	}
+
+	utf8_to_punycode(argv[1], strlen(argv[1]), dns_conf.server_name, DNS_MAX_SERVER_NAME_LEN);
+
+	return 0;
+}
+
 static struct config_item _config_item[] = {
-	CONF_STRING("server-name", (char *)dns_conf.server_name, DNS_MAX_SERVER_NAME_LEN),
+	CONF_CUSTOM("server-name", _config_server_name, NULL),
 	CONF_YESNO("resolv-hostname", &dns_conf.resolv_hostname),
 	CONF_CUSTOM("bind", _config_bind_ip_udp, NULL),
 	CONF_CUSTOM("bind-tcp", _config_bind_ip_tcp, NULL),
@@ -403,19 +416,25 @@ static void _dns_conf_auto_set_cache_size(void)
 	}
 
 	if (memsize <= 16 * 1024 * 1024) {
-		dns_conf.cachesize = 2048; /* 1MB memory */
+		dns_conf.cachesize = 4096; /* 2MB memory */
 	} else if (memsize <= 32 * 1024 * 1024) {
-		dns_conf.cachesize = 8192; /* 4MB memory*/
-	} else if (memsize <= 64 * 1024 * 1024) {
 		dns_conf.cachesize = 16384; /* 8MB memory*/
-	} else if (memsize <= 128 * 1024 * 1024) {
+	} else if (memsize <= 64 * 1024 * 1024) {
 		dns_conf.cachesize = 32768; /* 16MB memory*/
-	} else if (memsize <= 256 * 1024 * 1024) {
+	} else if (memsize <= 128 * 1024 * 1024) {
 		dns_conf.cachesize = 65536; /* 32MB memory*/
-	} else if (memsize <= 512 * 1024 * 1024) {
+	} else if (memsize <= 256 * 1024 * 1024) {
 		dns_conf.cachesize = 131072; /* 64MB memory*/
-	} else {
+	} else if (memsize <= 512LL * 1024 * 1024) {
+		dns_conf.cachesize = 196608; /* 96MB memory*/
+	} else if (memsize <= 1024LL * 1024 * 1024) {
 		dns_conf.cachesize = 262144; /* 128MB memory*/
+	} else if (memsize <= 2048LL * 1024 * 1024) {
+		dns_conf.cachesize = 393216; /* 192MB memory*/
+	} else if (memsize <= 4096LL * 1024 * 1024) {
+		dns_conf.cachesize = 524288; /* 256MB memory*/
+	} else {
+		dns_conf.cachesize = 1048576; /* 512MB memory*/
 	}
 }
 
@@ -434,6 +453,8 @@ static int _dns_conf_load_post(void)
 	}
 
 	_dns_conf_group_post();
+
+	_dns_conf_dns64_post();
 
 	_config_domain_set_name_table_destroy();
 

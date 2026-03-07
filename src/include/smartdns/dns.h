@@ -78,7 +78,8 @@ typedef enum dns_type {
 	DNS_T_HTTPS = 65,
 	DNS_T_SPF = 99,
 	DNS_T_AXFR = 252,
-	DNS_T_ALL = 255
+	DNS_T_CAA = 257,
+	DNS_T_ALL = 65535,
 } dns_type_t;
 
 typedef enum dns_opt_code {
@@ -335,6 +336,7 @@ struct dns_update_param {
 	int id;
 	int ip_ttl;
 	int cname_ttl;
+	const char *query_domain;
 };
 
 int dns_packet_update(unsigned char *data, int size, struct dns_update_param *param);

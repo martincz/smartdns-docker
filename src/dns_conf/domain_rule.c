@@ -236,7 +236,7 @@ static __attribute__((unused)) struct dns_domain_rule *_config_domain_rule_get(c
 	return art_search(&_config_current_rule_group()->domain_rule.tree, (unsigned char *)domain_key, len);
 }
 
-static int _config_domain_rule_free(struct dns_domain_rule *domain_rule)
+int _config_domain_rule_free(struct dns_domain_rule *domain_rule)
 {
 	int i = 0;
 
@@ -539,7 +539,7 @@ static int _conf_domain_rule_no_ipalias(const char *domain)
 	return _config_domain_rule_flag_set(domain, DOMAIN_FLAG_NO_IPALIAS, 0);
 }
 
-static int _conf_domain_rule_response_mode(char *domain, const char *mode)
+int _conf_domain_rule_response_mode(char *domain, const char *mode)
 {
 	enum response_mode_type response_mode_type = DNS_RESPONSE_MODE_FIRST_PING_IP;
 	struct dns_response_mode_rule *response_mode = NULL;
@@ -571,7 +571,7 @@ errout:
 	return 0;
 }
 
-static int _conf_domain_rule_speed_check(char *domain, const char *mode)
+int _conf_domain_rule_speed_check(char *domain, const char *mode)
 {
 	struct dns_domain_check_orders *check_orders = NULL;
 
@@ -724,7 +724,7 @@ int _config_domain_rules(void *data, int argc, char *argv[])
 	}
 
 	if (group != NULL) {
-		_config_current_group_push(group);
+		_config_current_group_push(group, NULL);
 	}
 
 	/* process extra options */

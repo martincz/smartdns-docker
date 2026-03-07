@@ -42,6 +42,7 @@ static int _dns_cache_is_specify_packet(int qtype)
 	case DNS_T_HTTPS:
 	case DNS_T_TXT:
 	case DNS_T_SRV:
+	case DNS_T_CAA:
 		break;
 	default:
 		return -1;
@@ -413,7 +414,13 @@ static int _dns_server_process_cache_packet(struct dns_request *request, struct 
 
 	struct dns_server_post_context context;
 	_dns_server_post_context_init(&context, request);
-	context.inpacket = cache_packet->data;
+
+	if (request->original_domain != NULL && cache_packet->head.size < DNS_IN_PACKSIZE) {
+		context.inpacket = context.inpacket_buff;
+		memcpy(context.inpacket, cache_packet->data, cache_packet->head.size);
+	} else {
+		context.inpacket = cache_packet->data;
+	}
 	context.inpacket_len = cache_packet->head.size;
 	request->ping_time = dns_cache->info.speed;
 
