@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2025 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -16,8 +16,8 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "bitmap.h"
-#include "bitops.h"
+#include "smartdns/lib/bitmap.h"
+#include "smartdns/lib/bitops.h"
 
 /*
  * This is a common helper function for find_next_bit, find_next_zero_bit, and
@@ -168,4 +168,5 @@ unsigned long __sw_hweight64(uint64_t w)
 	return (res + (res >> 32)) & 0x00000000000000FFul;
 #endif
 #endif
+	return 0;
 }

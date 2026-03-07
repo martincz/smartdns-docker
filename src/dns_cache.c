@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2025 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -16,11 +16,14 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "dns_cache.h"
-#include "stringutil.h"
-#include "timer.h"
-#include "tlog.h"
-#include "util.h"
+#define _GNU_SOURCE
+
+#include "smartdns/dns_cache.h"
+#include "smartdns/dns_stats.h"
+#include "smartdns/lib/stringutil.h"
+#include "smartdns/timer.h"
+#include "smartdns/tlog.h"
+#include "smartdns/util.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -118,11 +121,16 @@ void dns_cache_get(struct dns_cache *dns_cache)
 
 void dns_cache_release(struct dns_cache *dns_cache)
 {
+	int refcnt = 0;
 	if (dns_cache == NULL) {
 		return;
 	}
 
-	if (!atomic_dec_and_test(&dns_cache->ref)) {
+	refcnt = atomic_dec_return(&dns_cache->ref);
+	if (refcnt > 0) {
+		return;
+	} else if (refcnt < 0) {
+		BUG("dns_cache refcnt is invalid: %d", refcnt);
 		return;
 	}
 
@@ -131,6 +139,7 @@ void dns_cache_release(struct dns_cache *dns_cache)
 
 static void _dns_cache_remove(struct dns_cache *dns_cache)
 {
+	dns_cache->del_pending = 0;
 	hash_del(&dns_cache->node);
 	list_del_init(&dns_cache->list);
 	dns_timer_del(&dns_cache->timer);
@@ -175,7 +184,7 @@ struct dns_cache_data *dns_cache_new_data_packet(void *packet, size_t packet_len
 static void dns_cache_timer_release(struct tw_base *base, struct tw_timer_list *timer, void *data)
 {
 	struct dns_cache *dns_cache = data;
-	dns_cache_delete(dns_cache);
+	dns_cache_release(dns_cache);
 }
 
 static void dns_cache_expired(struct tw_base *base, struct tw_timer_list *timer, void *data, unsigned long timestamp)
@@ -210,6 +219,70 @@ static void dns_cache_expired(struct tw_base *base, struct tw_timer_list *timer,
 	dns_timer_mod(&dns_cache->timer, 5);
 }
 
+static struct dns_cache *_dns_cache_lookup(struct dns_cache_key *cache_key)
+{
+	uint32_t key = 0;
+	struct dns_cache *dns_cache = NULL;
+	struct dns_cache *dns_cache_ret = NULL;
+	time_t now = 0;
+
+	key = hash_string(cache_key->domain);
+	key = jhash(&cache_key->qtype, sizeof(cache_key->qtype), key);
+	key = hash_string_initval(cache_key->dns_group_name, key);
+	key = jhash(&cache_key->query_flag, sizeof(cache_key->query_flag), key);
+
+	time(&now);
+	/* find cache */
+	pthread_mutex_lock(&dns_cache_head.lock);
+	hash_table_for_each_possible(dns_cache_head.cache_hash, dns_cache, node, key)
+	{
+		if (dns_cache->info.qtype != cache_key->qtype) {
+			continue;
+		}
+
+		if (strncmp(cache_key->domain, dns_cache->info.domain, DNS_MAX_CNAME_LEN) != 0) {
+			continue;
+		}
+
+		if (strncmp(cache_key->dns_group_name, dns_cache->info.dns_group_name, DNS_GROUP_NAME_LEN) != 0) {
+			continue;
+		}
+
+		if (cache_key->query_flag != dns_cache->info.query_flag) {
+			continue;
+		}
+
+		dns_cache_ret = dns_cache;
+		break;
+	}
+
+	if (dns_cache_ret) {
+		dns_cache_get(dns_cache_ret);
+	}
+
+	pthread_mutex_unlock(&dns_cache_head.lock);
+
+	return dns_cache_ret;
+}
+
+struct dns_cache *dns_cache_lookup(struct dns_cache_key *cache_key)
+{
+	struct dns_cache *dns_cache_ret = NULL;
+
+	if (dns_cache_head.size <= 0) {
+		return NULL;
+	}
+
+	stats_inc(&dns_stats.cache.check_count);
+	dns_cache_ret = _dns_cache_lookup(cache_key);
+
+	if (dns_cache_ret) {
+		stats_inc(&dns_stats.cache.hit_count);
+	}
+
+	return dns_cache_ret;
+}
+
 static int _dns_cache_replace(struct dns_cache_key *cache_key, int rcode, int ttl, int speed, int timeout,
 							  int update_time, struct dns_cache_data *cache_data)
 {
@@ -221,7 +294,7 @@ static int _dns_cache_replace(struct dns_cache_key *cache_key, int rcode, int tt
 	}
 
 	/* lookup existing cache */
-	dns_cache = dns_cache_lookup(cache_key);
+	dns_cache = _dns_cache_lookup(cache_key);
 	if (dns_cache == NULL) {
 		return -1;
 	}
@@ -423,7 +496,7 @@ int dns_cache_insert(struct dns_cache_key *cache_key, int rcode, int ttl, int sp
 
 int dns_cache_update_timer(struct dns_cache_key *key, int timeout)
 {
-	struct dns_cache *dns_cache = dns_cache_lookup(key);
+	struct dns_cache *dns_cache = _dns_cache_lookup(key);
 	if (dns_cache == NULL) {
 		return -1;
 	}
@@ -436,56 +509,6 @@ int dns_cache_update_timer(struct dns_cache_key *key, int timeout)
 	dns_cache_release(dns_cache);
 
 	return 0;
-}
-
-struct dns_cache *dns_cache_lookup(struct dns_cache_key *cache_key)
-{
-	uint32_t key = 0;
-	struct dns_cache *dns_cache = NULL;
-	struct dns_cache *dns_cache_ret = NULL;
-	time_t now = 0;
-
-	if (dns_cache_head.size <= 0) {
-		return NULL;
-	}
-
-	key = hash_string(cache_key->domain);
-	key = jhash(&cache_key->qtype, sizeof(cache_key->qtype), key);
-	key = hash_string_initval(cache_key->dns_group_name, key);
-	key = jhash(&cache_key->query_flag, sizeof(cache_key->query_flag), key);
-
-	time(&now);
-	/* find cache */
-	pthread_mutex_lock(&dns_cache_head.lock);
-	hash_table_for_each_possible(dns_cache_head.cache_hash, dns_cache, node, key)
-	{
-		if (dns_cache->info.qtype != cache_key->qtype) {
-			continue;
-		}
-
-		if (strncmp(cache_key->domain, dns_cache->info.domain, DNS_MAX_CNAME_LEN) != 0) {
-			continue;
-		}
-
-		if (strncmp(cache_key->dns_group_name, dns_cache->info.dns_group_name, DNS_GROUP_NAME_LEN) != 0) {
-			continue;
-		}
-
-		if (cache_key->query_flag != dns_cache->info.query_flag) {
-			continue;
-		}
-
-		dns_cache_ret = dns_cache;
-		break;
-	}
-
-	if (dns_cache_ret) {
-		dns_cache_get(dns_cache_ret);
-	}
-
-	pthread_mutex_unlock(&dns_cache_head.lock);
-
-	return dns_cache_ret;
 }
 
 int dns_cache_get_ttl(struct dns_cache *dns_cache)
@@ -619,18 +642,26 @@ static int _dns_cache_read_to_cache(struct dns_cache_record *cache_record, struc
 		info->replace_time = now;
 	}
 
+	int passed_time = now - info->replace_time;
+	int timeout = info->timeout - passed_time;
+
 	struct dns_conf_group *rule_group = dns_server_get_rule_group(info->dns_group_name);
-	expired_time = rule_group->dns_serve_expired_prefetch_time;
-	if (expired_time == 0) {
-		expired_time = rule_group->dns_serve_expired_ttl / 2;
-		if (expired_time == 0 || expired_time > EXPIRED_DOMAIN_PREFETCH_TIME) {
-			expired_time = EXPIRED_DOMAIN_PREFETCH_TIME;
+
+	if (rule_group->dns_prefetch) {
+		if (rule_group->dns_serve_expired) {
+			expired_time = rule_group->dns_serve_expired_prefetch_time;
+			if (expired_time == 0) {
+				expired_time = rule_group->dns_serve_expired_ttl / 2;
+				if (expired_time == 0 || expired_time > EXPIRED_DOMAIN_PREFETCH_TIME) {
+					expired_time = EXPIRED_DOMAIN_PREFETCH_TIME;
+				}
+			}
+		} else {
+			timeout -= 3;
 		}
 	}
 
-	int passed_time = now - info->replace_time;
-	int timeout = info->timeout - passed_time;
-	if ((timeout > expired_time + info->ttl) && expired_time >= 0) {
+	if ((timeout > expired_time + info->ttl) && expired_time > 0) {
 		timeout = expired_time + info->ttl;
 	}
 
@@ -657,6 +688,7 @@ static int _dns_cache_read_record(int fd, uint32_t cache_number, dns_cache_read_
 {
 	unsigned int i = 0;
 	ssize_t ret = 0;
+	int data_size = 0;
 	struct dns_cache_record cache_record;
 	struct dns_cache_data_head data_head;
 	struct dns_cache_data *cache_data = NULL;
@@ -689,7 +721,8 @@ static int _dns_cache_read_record(int fd, uint32_t cache_number, dns_cache_read_
 			goto errout;
 		}
 
-		cache_data = malloc(data_head.size + sizeof(data_head));
+		data_size = data_head.size + sizeof(data_head);
+		cache_data = malloc(data_size);
 		if (cache_data == NULL) {
 			tlog(TLOG_ERROR, "malloc cache data failed %s", strerror(errno));
 			goto errout;
@@ -707,6 +740,7 @@ static int _dns_cache_read_record(int fd, uint32_t cache_number, dns_cache_read_
 		cache_record.info.is_visited = 0;
 		cache_record.info.domain[DNS_MAX_CNAME_LEN - 1] = '\0';
 		cache_record.info.dns_group_name[DNS_GROUP_NAME_LEN - 1] = '\0';
+		atomic_add(data_size, &dns_cache_head.mem_size);
 		ret = callback(&cache_record, cache_data);
 		dns_cache_data_put(cache_data);
 		cache_data = NULL;

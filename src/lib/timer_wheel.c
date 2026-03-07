@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2025 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -16,7 +16,9 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "bitops.h"
+#define _GNU_SOURCE
+
+#include "smartdns/lib/bitops.h"
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,7 +27,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#include "timer_wheel.h"
+#include "smartdns/lib/timer_wheel.h"
 
 #define TVR_BITS 10
 #define TVN_BITS 6
@@ -167,7 +169,6 @@ void tw_add_timer(struct tw_base *base, struct tw_timer_list *timer)
 int tw_del_timer(struct tw_base *base, struct tw_timer_list *timer)
 {
 	int ret = 0;
-	int call_del = 0;
 
 	pthread_spin_lock(&base->lock);
 	{
@@ -175,15 +176,15 @@ int tw_del_timer(struct tw_base *base, struct tw_timer_list *timer)
 			ret = 1;
 			_tw_detach_timer(timer);
 			if (timer->del_function) {
-				call_del = 1;
+				tw_del_func del_func = timer->del_function;
+				timer->del_function = NULL;
+				pthread_spin_unlock(&base->lock);
+				del_func(base, timer, timer->data);
+				pthread_spin_lock(&base->lock);
 			}
 		}
 	}
 	pthread_spin_unlock(&base->lock);
-
-	if (call_del) {
-		timer->del_function(base, timer, timer->data);
-	}
 
 	return ret;
 }
@@ -285,8 +286,10 @@ static inline void run_timers(struct tw_base *base)
 
 			pthread_spin_lock(&base->lock);
 			if ((timer_pending(timer) == 0 && timer->del_function)) {
+				tw_del_func del_func = timer->del_function;
+				timer->del_function = NULL;
 				pthread_spin_unlock(&base->lock);
-				timer->del_function(base, timer, timer->data);
+				del_func(base, timer, timer->data);
 				pthread_spin_lock(&base->lock);
 			}
 		}
@@ -377,7 +380,7 @@ struct tw_base *tw_init_timers(void)
 		INIT_LIST_HEAD(base->tv1.vec + j);
 	}
 
-	ret = gettimeofday(&tv, 0);
+	ret = gettimeofday(&tv, NULL);
 	if (ret < 0) {
 		goto errout1;
 	}

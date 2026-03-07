@@ -55,12 +55,14 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#define _GNU_SOURCE
+
 #include <sys/types.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
-#include "radix.h"
+#include "smartdns/lib/radix.h"
 
 /* $Id: radix.c,v 1.17 2007/10/24 06:04:31 djm Exp $ */
 
@@ -558,12 +560,25 @@ sanitise_mask(unsigned char *addr, unsigned int masklen, unsigned int maskbits)
 		addr[i] = 0;
 }
 
+static void
+update_addr(const char **addr_ptr, const char *addr, size_t len)
+{
+	const char *ipv6_prefix = "::ffff:0:0";
+
+	if (strncmp(addr, "::ffff", len) == 0) 
+		*addr_ptr = ipv6_prefix;
+	else
+		*addr_ptr = (char *)addr;
+}
+
 prefix_t
 *prefix_pton(const char *string, long len, prefix_t *prefix, const char **errmsg)
 {
-	char save[256], *cp, *ep;
+	static char save[256];
+	char *cp, *ep;
 	struct addrinfo hints, *ai;
 	void *addr;
+	const char *addr_str = NULL;
 	prefix_t *ret;
 	size_t slen;
 	int r;
@@ -593,7 +608,9 @@ prefix_t
 	memset(&hints, '\0', sizeof(hints));
 	hints.ai_flags = AI_NUMERICHOST;
 
-	if ((r = getaddrinfo(save, NULL, &hints, &ai)) != 0) {
+	update_addr(&addr_str, save, slen);
+
+	if ((r = getaddrinfo(addr_str, NULL, &hints, &ai)) != 0) {
 		snprintf(save, sizeof(save), "getaddrinfo: %s:",
 		    gai_strerror(r));
 		*errmsg = save;
