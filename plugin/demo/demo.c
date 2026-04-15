@@ -1,11 +1,11 @@
 #include "demo.h"
-#include "dns_server.h"
-#include "util.h"
+#include "smartdns/dns_server.h"
+#include "smartdns/tlog.h"
+#include "smartdns/util.h"
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <stdio.h>
 #include <sys/socket.h>
-#include <tlog.h>
 
 static int demo_server_recv(struct dns_packet *packet, unsigned char *inpacket, int inpacket_len,
 							struct sockaddr_storage *local, socklen_t local_len, struct sockaddr_storage *from,
@@ -46,4 +46,9 @@ int dns_plugin_exit(struct dns_plugin *plugin)
 	tlog(TLOG_INFO, "demo plugin exit.");
 	smartdns_operations_unregister(&demo_ops);
 	return 0;
+}
+
+int dns_plugin_api_version(void)
+{
+	return SMARTDNS_PLUGIN_API_VERSION;
 }

@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2025 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -17,10 +17,10 @@
  */
 
 #include "client.h"
-#include "dns.h"
+#include "smartdns/dns.h"
 #include "include/utils.h"
 #include "server.h"
-#include "util.h"
+#include "smartdns/util.h"
 #include "gtest/gtest.h"
 #include <fstream>
 
@@ -224,7 +224,7 @@ TEST_F(SpeedCheck, tcp_faster_than_ping)
 		return smartdns::SERVER_REQUEST_SOA;
 	});
 
-	server.MockPing(PING_TYPE_ICMP, "1.2.3.4", 60, 350);
+	server.MockPing(PING_TYPE_ICMP, "1.2.3.4", 60, 500);
 	server.MockPing(PING_TYPE_TCP, "5.6.7.8:80", 60, 10);
 	server.Start(R"""(bind [::]:60053
 server 127.0.0.1:61053

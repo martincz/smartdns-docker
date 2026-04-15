@@ -1,5 +1,5 @@
 --
--- Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
+-- Copyright (C) 2018-2025 Ruilin Peng (Nick) <pymumu@gmail.com>.
 --
 -- smartdns is free software: you can redistribute it and/or modify
 -- it under the terms of the GNU General Public License as published by
@@ -45,9 +45,9 @@ o.rempty      = false
 
 ---- server name
 o = s:taboption("settings", Value, "server_name", translate("Server Name"), translate("Smartdns server name"))
-o.default     = "smartdns"
+o.placeholder = "server name"
 o.datatype    = "hostname"
-o.rempty      = false
+o.rempty      = true
 
 ---- Port
 o = s:taboption("settings", Value, "port", translate("Local Port"), 

@@ -1,19 +1,10 @@
 #!/bin/sh /etc/rc.common
-#
-# Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
-#
-# smartdns is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# smartdns is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+# Copyright (C) 2018-2025 Ruilin Peng (Nick) <pymumu@gmail.com>.
+
+# smartdns is free software under the GPLv3 (or later).
+# Distributed without any warranty; see the license for details.
+# Full license: http://www.gnu.org/licenses/
 
 START=19
 STOP=82
@@ -57,11 +48,13 @@ set_forward_dnsmasq()
 		return
 	fi
 
-	uci -q delete dhcp.@dnsmasq[0].server
-	uci -q add_list dhcp.@dnsmasq[0].server="$addr"
-	uci -q set dhcp.@dnsmasq[0].noresolv=1
-	uci -q set dhcp.@dnsmasq[0].rebind_protection=0
-	uci -q set dhcp.@dnsmasq[0].domainneeded=0
+	uci_batch=""
+	uci_batch="$uci_batch delete dhcp.@dnsmasq[0].server\n"
+	uci_batch="$uci_batch add_list dhcp.@dnsmasq[0].server=\"$addr\"\n"
+	uci_batch="$uci_batch set dhcp.@dnsmasq[0].noresolv=1\n"
+	uci_batch="$uci_batch set dhcp.@dnsmasq[0].rebind_protection=0\n"
+	uci_batch="$uci_batch set dhcp.@dnsmasq[0].domainneeded=0\n"
+	echo -e "$uci_batch" | uci batch -q -
 	uci commit dhcp
 	/etc/init.d/dnsmasq reload
 }
@@ -76,10 +69,12 @@ stop_forward_dnsmasq()
 		return
 	fi
 	
-	uci -q delete dhcp.@dnsmasq[0].server
-	uci -q delete dhcp.@dnsmasq[0].noresolv
-	uci -q set dhcp.@dnsmasq[0].rebind_protection=1
-	uci -q set dhcp.@dnsmasq[0].domainneeded=1
+	uci_batch=""
+	uci_batch="$uci_batch delete dhcp.@dnsmasq[0].server\n"
+	uci_batch="$uci_batch delete dhcp.@dnsmasq[0].noresolv\n"
+	uci_batch="$uci_batch set dhcp.@dnsmasq[0].rebind_protection=1\n"
+	uci_batch="$uci_batch set dhcp.@dnsmasq[0].domainneeded=1\n"
+	echo -e "$uci_batch" | uci batch -q -
 	uci commit dhcp
 	[ "$norestart" != "1" ] && /etc/init.d/dnsmasq reload
 }
@@ -87,23 +82,30 @@ stop_forward_dnsmasq()
 set_main_dns()
 {
 	local hostip
-	hostip="$(uci -q get network.lan.ipaddr)"
+	hostip="$(uci -q get network.lan.ipaddr | sed 's/\/.*//g')"
 	dnsmasq_port="$(uci -q get dhcp.@dnsmasq[0].port)"
 	[ -z "$dnsmasq_port" ] && dnsmasq_port="53"
 	
 	[ -z "$hostip" ] && return
+
+	uci_batch=""
 	[ "$dnsmasq_port" = "53" ] && {
-		uci -q set dhcp.@dnsmasq[0].port=0
-		uci -q add_list dhcp.lan.dhcp_option="6,$hostip"
+		uci_batch="$uci_batch set dhcp.@dnsmasq[0].port=0\n"
+		uci_batch="$uci_batch add_list dhcp.lan.dhcp_option=\"6,$hostip\"\n"
 	}
 
 	# for some third-party firmware
 	redir_dns="$(uci -q get dhcp.@dnsmasq[0].dns_redirect)"
 	[ "$redir_dns" = "1" ] && {
-		uci -q set dhcp.@dnsmasq[0].dns_redirect=0
-		uci -q set dhcp.@dnsmasq[0].old_dns_redirect=1
+		uci_batch="$uci_batch set dhcp.@dnsmasq[0].dns_redirect=0\n"
+		uci_batch="$uci_batch set dhcp.@dnsmasq[0].old_dns_redirect=1\n"
 	}
 
+	if [ -z "$uci_batch" ]; then
+		return
+	fi
+
+	echo -e "$uci_batch" | uci batch -q -
 	uci commit dhcp
 	/etc/init.d/dnsmasq reload
 }
@@ -115,12 +117,15 @@ stop_main_dns()
 	dnsmasq_port="$(uci -q get dhcp.@dnsmasq[0].port)"
 	redir_dns="$(uci -q get dhcp.@dnsmasq[0].old_dns_redirect)"
 	[ "$dnsmasq_port" != "0" ] && return
+
+	uci_batch=""
 	[ "$redir_dns" = "1" ] && {
-		uci -q set dhcp.@dnsmasq[0].dns_redirect=1
-		uci -q delete dhcp.@dnsmasq[0].old_dns_redirect
+		uci_batch="$uci_batch set dhcp.@dnsmasq[0].dns_redirect=1\n"
+		uci_batch="$uci_batch delete dhcp.@dnsmasq[0].old_dns_redirect\n"
 	}
-	uci -q delete dhcp.@dnsmasq[0].port
-	uci -q del_list dhcp.lan.dhcp_option="6,$hostip"
+	uci_batch="$uci_batch delete dhcp.@dnsmasq[0].port\n"
+	uci_batch="$uci_batch del_list dhcp.lan.dhcp_option=\"6,$hostip\"\n"
+	echo -e "$uci_batch" | uci batch -q -
 	uci commit dhcp
 	[ "$norestart" != "1" ] && /etc/init.d/dnsmasq reload
 }
@@ -200,6 +205,7 @@ load_server()
 	config_get addition_arg "$section" "addition_arg" ""
 	config_get set_mark "$section" "set_mark" ""
 	config_get_bool use_proxy "$section" "use_proxy" "0"
+	config_get fallback "$section" "fallback" "0"
 
 	[ "$enabled" = "0" ] && return
 
@@ -214,11 +220,15 @@ load_server()
 		SERVER="server-tls"
 	elif [ "$type" = "https" ]; then
 		SERVER="server-https"
+	elif [ "$type" = "quic" ]; then
+		SERVER="server-quic"
+	elif [ "$type" = "h3" ]; then
+		SERVER="server-h3"
 	fi
 
 	if echo "$ip" | grep "://" >/dev/null 2>&1; then
 		IS_URI="1"
-	elif echo "$ip" | grep ":"; then
+	elif echo "$ip" | grep ":" >/dev/null 2>&1; then
 		if ! echo "$ip" | grep -q "\\[" >/dev/null 2>&1; then
 			ip="[$ip]"
 		fi
@@ -235,6 +245,7 @@ load_server()
 	[ -z "$spki_pin" ] || ADDITIONAL_ARGS="$ADDITIONAL_ARGS -spki-pin $spki_pin"
 	[ -z "$set_mark" ] || ADDITIONAL_ARGS="$ADDITIONAL_ARGS -set-mark $set_mark"
 	[ "$use_proxy" = "0" ] || ADDITIONAL_ARGS="$ADDITIONAL_ARGS -proxy default-proxy"
+	[ "$fallback" = "1" ] && addition_arg="$addition_arg -fallback"
 
 	if [ -z "$port" ] || [ "$IS_URI" = "1" ]; then
 		DNS_ADDRESS="$ip"
@@ -760,6 +771,12 @@ load_service()
 	config_get dns64 "$section" "dns64" ""
 	[ -z "$dns64" ] || conf_append "dns64" "$dns64"
 
+	config_get ddns_domain "$section" "ddns_domain" ""
+	[ -z "$ddns_domain" ] || conf_append "ddns-domain" "$ddns_domain"
+
+	config_get local_domain "$section" "local_domain" ""
+	[ -z "$local_domain" ] || conf_append "local-domain" "$local_domain"
+
 	config_get_bool mdns_lookup "$section" "mdns_lookup" "0"
 	[ "$mdns_lookup" = "1" ] && conf_append "mdns-lookup" "yes"
 
@@ -772,11 +789,12 @@ load_service()
 	[ -e "$resolve_file" ] && conf_append "resolv-file" "$resolve_file"
 
 	# upgrade old configuration
+	uci_batch=""
 	if [ "$redirect" = "redirect" ] || [ "$redirect" = "dnsmasq-upstream" ] || [ "$redirect" = "none" ]; then
 		[ "$redirect" = "redirect" ] && {
 			clear_iptable "$port"
 			clear_iptable "$old_port"
-			uci -q delete smartdns.@smartdns[0].port
+			uci_batch="$uci_batch delete smartdns.@smartdns[0].port\n"
 			port="53"
 		}
 
@@ -784,29 +802,30 @@ load_service()
 			stop_forward_dnsmasq "$port"
 			stop_forward_dnsmasq "$old_port"
 			auto_set_dnsmasq="1"
-			uci -q set smartdns.@smartdns[0].auto_set_dnsmasq="1"
+			uci_batch="$uci_batch set smartdns.@smartdns[0].auto_set_dnsmasq=\"1\"\n"
 		}
 
 		[ "$redirect" = "none" ] && {
 			auto_set_dnsmasq="0"
-			uci -q set smartdns.@smartdns[0].auto_set_dnsmasq="0"
+			uci_batch="$uci_batch set smartdns.@smartdns[0].auto_set_dnsmasq=\"0\"\n"
 		}
-		uci -q delete smartdns.@smartdns[0].redirect
-		uci -q delete smartdns.@smartdns[0].old_redirect
+		uci_batch="$uci_batch delete smartdns.@smartdns[0].redirect\n"
+		uci_batch="$uci_batch delete smartdns.@smartdns[0].old_redirect\n"
 	fi
 
-	uci -q delete smartdns.@smartdns[0].old_port
-	uci -q delete smartdns.@smartdns[0].old_enabled
-	uci -q delete smartdns.@smartdns[0].old_auto_set_dnsmasq
-	uci -q set smartdns.@smartdns[0].old_port="$port"
-	uci -q set smartdns.@smartdns[0].old_enabled="$enabled"
-	uci -q set smartdns.@smartdns[0].old_auto_set_dnsmasq="$auto_set_dnsmasq"
+	uci_batch="$uci_batch delete smartdns.@smartdns[0].old_port\n"
+	uci_batch="$uci_batch delete smartdns.@smartdns[0].old_enabled\n"
+	uci_batch="$uci_batch delete smartdns.@smartdns[0].old_auto_set_dnsmasq\n"
+	uci_batch="$uci_batch set smartdns.@smartdns[0].old_port=\"$port\"\n"
+	uci_batch="$uci_batch set smartdns.@smartdns[0].old_enabled=\"$enabled\"\n"
+	uci_batch="$uci_batch set smartdns.@smartdns[0].old_auto_set_dnsmasq=\"$auto_set_dnsmasq\"\n"
+	echo -e "$uci_batch" | uci batch -q -
 	uci commit smartdns
 
 	# disable service
 	[ "$enabled" = "0" ] && {
 		[ "$old_enabled" = "0" ] && return 1
-		[ "$old_port" = "53" ] && stop_main_dns "0"
+		[ "$old_port" = "53" ] && [ "$old_auto_set_dnsmasq" = "1" ] && stop_main_dns "0"
 		[ "$old_port" != "53" ] && [ "$old_auto_set_dnsmasq" = "1" ] && stop_forward_dnsmasq "$old_port" "0"
 		disable_auto_update
 		return 1
@@ -817,13 +836,16 @@ load_service()
 		[ "$old_port" = "53" ] && {
 			no_restart_dnsmasq="1"
 			[ "$auto_set_dnsmasq" = "0" ] && no_restart_dnsmasq="0"
-			stop_main_dns "$no_restart_dnsmasq"
+			[ "$old_auto_set_dnsmasq" = "1" ] && stop_main_dns "$no_restart_dnsmasq"
 		}
 		[ "$old_port" != "53" ] && [ "$old_auto_set_dnsmasq" = "1" ] && stop_forward_dnsmasq "$old_port" "1"
 	}
 
 	# start service
-	[ "$port" = "53" ] && set_main_dns
+	[ "$port" = "53" ] && {
+		[ "$auto_set_dnsmasq" = "1" ] && set_main_dns
+		[ "$auto_set_dnsmasq" = "0" ] && [ "$old_auto_set_dnsmasq" = "1" ] && stop_main_dns "0"
+	}
 	[ "$port" != "53" ] && {
 		[ "$auto_set_dnsmasq" = "1" ] && set_forward_dnsmasq "$port"
 		[ "$auto_set_dnsmasq" = "0" ] && [ "$old_auto_set_dnsmasq" = "1" ] && stop_forward_dnsmasq "$old_port" "0"
@@ -855,6 +877,22 @@ load_service()
 	config_foreach load_IP_rule_list "ip-rule"
 
 	config_foreach load_IP_rule_list "ip-rule-list"
+
+	config_get_bool ui "$section" "ui" '0'
+
+	[ "$ui" = "1" ] && {
+		config_get ui_port "$section" "ui_port" "6080"
+		config_get ui_data_dir "$section" "ui_data_dir" "/var/lib/smartdns"
+		config_get ui_log_max_age "$section" "ui_log_max_age" "30"
+
+		ui_log_max_age_s=$((ui_log_max_age * 86400))
+
+		conf_append "plugin" "smartdns_ui.so"
+		conf_append "smartdns-ui.www-root" "/usr/share/smartdns/wwwroot"
+		conf_append "smartdns-ui.ip" "http://[::]:$ui_port"
+		conf_append "data-dir" "$ui_data_dir"
+		conf_append "smartdns-ui.max-query-log-age" "$ui_log_max_age_s"
+	}
 
 	{
 		echo "conf-file $ADDRESS_CONF"
@@ -896,7 +934,7 @@ unload_service()
 
 	[ "$enabled" = "1" ] && {
 		[ "$old_enabled" = "0" ] && return 1
-		[ "$old_port" = "53" ] && stop_main_dns "0"
+		[ "$old_port" = "53" ] && [ "$old_auto_set_dnsmasq" = "1" ] && stop_main_dns "0"
 		[ "$old_port" != "53" ] && [ "$old_auto_set_dnsmasq" = "1" ] && stop_forward_dnsmasq "$old_port" "0"
 	}
 }

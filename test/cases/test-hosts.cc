@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2025 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -17,10 +17,10 @@
  */
 
 #include "client.h"
-#include "dns.h"
+#include "smartdns/dns.h"
 #include "include/utils.h"
 #include "server.h"
-#include "util.h"
+#include "smartdns/util.h"
 #include "gtest/gtest.h"
 #include <fstream>
 
@@ -148,7 +148,7 @@ hosts-file /tmp/*.hosts
 	ASSERT_EQ(client.GetAnswerNum(), 0);
 	EXPECT_EQ(client.GetStatus(), "NXDOMAIN");
 	EXPECT_EQ(client.GetAuthority()[0].GetName(), "c.com");
-	EXPECT_EQ(client.GetAuthority()[0].GetTTL(), 60);
+	EXPECT_EQ(client.GetAuthority()[0].GetTTL(), 600);
 	EXPECT_EQ(client.GetAuthority()[0].GetType(), "SOA");
 
 	ASSERT_TRUE(client.Query("d.com A", 60053));

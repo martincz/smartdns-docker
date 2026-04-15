@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2025 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -149,9 +149,9 @@ return view.extend({
 
 		// server name;
 		o = s.taboption("settings", form.Value, "server_name", _("Server Name"), _("Smartdns server name"));
-		o.default = "smartdns";
+		o.placeholder = "server name";
 		o.datatype = "hostname";
-		o.rempty = false;
+		o.rempty = true;
 
 		// Port;
 		o = s.taboption("settings", form.Value, "port", _("Local Port"),

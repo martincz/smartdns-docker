@@ -1,7 +1,7 @@
 
 /*************************************************************************
  *
- * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2025 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -18,7 +18,7 @@
  */
 
 #define _GNU_SOURCE
-#include "idna.h"
+#include "smartdns/lib/idna.h"
 #include <limits.h>
 
 static unsigned _utf8_decode_slow(const char **p, const char *pe, unsigned a)
@@ -101,7 +101,7 @@ static unsigned _utf8_decode(const char **p, const char *pe)
 	return _utf8_decode_slow(p, pe, a);
 }
 
-static int _utf8_to_punycode_label(const char *s, const char *se, char **d, char *de)
+static int _utf8_to_punycode_label(const char *s, const char *se, char **d, const char *de)
 {
 	static const char alphabet[] = "abcdefghijklmnopqrstuvwxyz0123456789";
 	const char *ss;
