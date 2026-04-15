@@ -49,17 +49,17 @@ RUN cd /build/smartdns && \
     mkdir -p /release/var/log /release/run /release/var/lib/smartdns && \
     cp package/smartdns/etc /release/ -a && \
     cp package/smartdns/usr /release/ -a && \
+    mkdir -p /release/opt/smartdns && \
+    cp package/smartdns/etc/smartdns /release/opt/ -a && \
     rm -f /release/usr/local/smartdns/lib/libssl* && \
     rm -f /release/usr/local/smartdns/lib/libcrypto* && \
     cp /opt/build/lib/lib*.so* /release/usr/local/lib/smartdns/lib/ -a 2>/dev/null || true && \
     cp /opt/build/lib64/lib*.so* /release/usr/local/lib/smartdns/lib/ -a 2>/dev/null || true && \
-    mkdir -p /release/opt/smartdns && \
-    cp package/smartdns/etc/smartdns /release/opt/ -a && \
     cd / && rm -rf /build
 
 FROM busybox:stable-musl
 COPY --from=smartdns-builder /release/ /
-EXPOSE 53/udp 6080/tcp
+EXPOSE 53/tcp 53/udp 6080/tcp
 VOLUME ["/etc/smartdns/", "/var/lib/smartdns/"]
 
 CMD ["/usr/sbin/smartdns", "-f", "-x"]
