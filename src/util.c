@@ -1873,23 +1873,6 @@ void print_stack(void)
 void print_stack(void) {}
 #endif
 
-bool file_exists(char *file_name) {
-	if (!fopen(file_name, "r")) {
-		return false;
-	}
-	return true;
-}
-
-void copy_file(char *source_file, char *target_file) {
-	int ch;
-	FILE *source = fopen(source_file, "r");
-	FILE *target = fopen(target_file, "w");
-	while ((ch = fgetc(source)) != EOF) {
-		fputc(ch, target);
-	}
-	fclose(source);
-	fclose(target);
-}
 
 void bug_ext(const char *file, int line, const char *func, const char *errfmt, ...)
 {

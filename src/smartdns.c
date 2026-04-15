@@ -1069,8 +1069,20 @@ int main(int argc, char *argv[])
 		goto errout;
 	}
 
-	if (!file_exists(config_file)) {
-		copy_file(SAMPLE_CONF_FILE, config_file);
+	if (access(config_file, F_OK) != 0) {
+		FILE *src = fopen(SAMPLE_CONF_FILE, "r");
+		if (src != NULL) {
+			FILE *dst = fopen(config_file, "w");
+			if (dst != NULL) {
+				char buf[4096];
+				size_t n;
+				while ((n = fread(buf, 1, sizeof(buf), src)) > 0) {
+					fwrite(buf, 1, n, dst);
+				}
+				fclose(dst);
+			}
+			fclose(src);
+		}
 	}
 
 	signal(SIGPIPE, SIG_IGN);

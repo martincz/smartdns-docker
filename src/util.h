@@ -19,7 +19,6 @@
 #ifndef SMART_DNS_UTIL_H
 #define SMART_DNS_UTIL_H
 
-#include <stdbool.h>
 #include "stringutil.h"
 #include <netdb.h>
 #include <time.h>
@@ -165,10 +164,6 @@ int set_sock_lingertime(int fd, int time);
 uint64_t get_free_space(const char *path);
 
 void print_stack(void);
-
-bool file_exists(char *file_name);
-
-void copy_file(char *source_file, char *target_file);
 
 void close_all_fd(int keepfd);
 
