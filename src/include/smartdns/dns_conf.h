@@ -51,7 +51,7 @@ extern "C" {
 #define DNS_PROXY_MAX_LEN 128
 #define DNS_CONF_USERNAME_LEN 32
 #define DNS_MAX_SPKI_LEN 64
-#define DNS_MAX_URL_LEN 256
+#define DNS_MAX_URL_LEN 1024
 #define DNS_MAX_PATH 1024
 #define DEFAULT_DNS_PORT 53
 #define DEFAULT_DNS_TLS_PORT 853
@@ -76,22 +76,31 @@ extern "C" {
 
 #define DNS64_IPV4ONLY_APRA_DOMAIN "ipv4only.arpa"
 
+/* Domain rule types, ordered by usage frequency for memory optimization */
 enum domain_rule {
-	DOMAIN_RULE_FLAGS = 0,
-	DOMAIN_RULE_ADDRESS_IPV4,
-	DOMAIN_RULE_ADDRESS_IPV6,
-	DOMAIN_RULE_IPSET,
-	DOMAIN_RULE_IPSET_IPV4,
-	DOMAIN_RULE_IPSET_IPV6,
-	DOMAIN_RULE_NFTSET_IP,
-	DOMAIN_RULE_NFTSET_IP6,
-	DOMAIN_RULE_NAMESERVER,
-	DOMAIN_RULE_GROUP,
-	DOMAIN_RULE_CHECKSPEED,
-	DOMAIN_RULE_RESPONSE_MODE,
-	DOMAIN_RULE_CNAME,
-	DOMAIN_RULE_HTTPS,
-	DOMAIN_RULE_TTL,
+	DOMAIN_RULE_FLAGS = 0, /* Flags (block, ignore, cache, etc.) */
+
+	DOMAIN_RULE_ADDRESS_IPV4, /* IPv4 address rule (ad-block, custom DNS) */
+	DOMAIN_RULE_ADDRESS_IPV6, /* IPv6 address rule */
+	DOMAIN_RULE_NAMESERVER,   /* Nameserver group (domain routing) */
+
+	DOMAIN_RULE_CHECKSPEED, /* Speed check mode */
+	DOMAIN_RULE_IPSET,      /* IPSet rule for traffic routing */
+	DOMAIN_RULE_NFTSET_IP,  /* NFTSet IPv4 */
+	DOMAIN_RULE_IPSET_IPV4, /* IPv4 IPSet */
+
+	DOMAIN_RULE_GROUP, /* Group rule */
+
+	DOMAIN_RULE_NFTSET_IP6, /* NFTSet IPv6 */
+	DOMAIN_RULE_IPSET_IPV6, /* IPv6 IPSet */
+
+	DOMAIN_RULE_HTTPS,         /* HTTPS record */
+	DOMAIN_RULE_SRV,           /* SRV record */
+	DOMAIN_RULE_RESPONSE_MODE, /* Response mode */
+	DOMAIN_RULE_CNAME,         /* CNAME rule */
+	DOMAIN_RULE_TTL,           /* TTL control */
+	DOMAIN_RULE_TXT,           /* TXT record */
+
 	DOMAIN_RULE_MAX,
 };
 
@@ -112,13 +121,15 @@ typedef enum {
 	DNS_BIND_TYPE_TCP,
 	DNS_BIND_TYPE_TLS,
 	DNS_BIND_TYPE_HTTPS,
+	DNS_BIND_TYPE_HTTP,
 } DNS_BIND_TYPE;
 
 typedef enum {
 	DOMAIN_CHECK_NONE = 0,
 	DOMAIN_CHECK_ICMP = 1,
 	DOMAIN_CHECK_TCP = 2,
-	DOMAIN_CHECK_NUM = 3,
+	DOMAIN_CHECK_TCP_SYN = 3,
+	DOMAIN_CHECK_NUM = 4,
 } DOMAIN_CHECK_TYPE;
 
 #define DOMAIN_FLAG_ADDR_SOA (1 << 0)
@@ -144,6 +155,7 @@ typedef enum {
 #define DOMAIN_FLAG_ENABLE_CACHE (1 << 20)
 #define DOMAIN_FLAG_ADDR_HTTPS_SOA (1 << 21)
 #define DOMAIN_FLAG_ADDR_HTTPS_IGN (1 << 22)
+#define DOMAIN_FLAG_NO_IGNORE_IP (1 << 23)
 
 #define IP_RULE_FLAG_BLACKLIST (1 << 0)
 #define IP_RULE_FLAG_WHITELIST (1 << 1)
@@ -170,6 +182,7 @@ typedef enum {
 #define BIND_FLAG_NO_SERVE_EXPIRED (1 << 14)
 #define BIND_FLAG_NO_RULES (1 << 15)
 #define BIND_FLAG_ACL (1 << 16)
+#define BIND_FLAG_DDR (1 << 17)
 
 enum response_mode_type {
 	DNS_RESPONSE_MODE_FIRST_PING_IP = 0,
@@ -180,6 +193,8 @@ enum response_mode_type {
 struct dns_rule {
 	atomic_t refcnt;
 	enum domain_rule rule;
+	unsigned char sub_only : 1;
+	unsigned char root_only : 1;
 };
 
 struct dns_rule_flags {
@@ -208,7 +223,9 @@ struct dns_ipset_name {
 struct dns_ipset_rule {
 	struct dns_rule head;
 	const char *ipsetname;
+	struct dns_ipset_rule *next;
 };
+
 
 struct dns_ipset_names {
 	char inet_enable;
@@ -245,6 +262,7 @@ struct dns_nftset_rule {
 	const char *familyname;
 	const char *nfttablename;
 	const char *nftsetname;
+	struct dns_nftset_rule *next;
 };
 
 struct dns_nftset_names {
@@ -259,9 +277,8 @@ extern struct dns_nftset_names dns_conf_nftset_no_speed;
 extern struct dns_nftset_names dns_conf_nftset;
 
 struct dns_domain_rule {
-	unsigned char sub_rule_only : 1;
-	unsigned char root_rule_only : 1;
-	struct dns_rule *rules[DOMAIN_RULE_MAX];
+	unsigned char capacity;   /* Current allocated capacity (max 255) */
+	struct dns_rule *rules[]; /* Flexible array member */
 };
 
 struct dns_nameserver_rule {
@@ -297,6 +314,7 @@ struct dns_response_mode_rule {
 };
 
 struct dns_https_record {
+	struct list_head list;
 	int enable;
 	char target[DNS_MAX_CNAME_LEN];
 	int priority;
@@ -319,8 +337,18 @@ struct dns_https_filter {
 
 struct dns_https_record_rule {
 	struct dns_rule head;
-	struct dns_https_record record;
+	struct list_head record_list;
 	struct dns_https_filter filter;
+};
+
+struct dns_srv_record_rule {
+	struct dns_rule head;
+	struct list_head record_list;
+};
+
+struct dns_txt_record_rule {
+	struct dns_rule head;
+	struct list_head record_list;
 };
 
 struct dns_group_table {
@@ -344,6 +372,7 @@ extern struct dns_ptr_table dns_ptr_table;
 typedef enum dns_hosts_type {
 	DNS_HOST_TYPE_HOST = 0,
 	DNS_HOST_TYPE_DNSMASQ = 1,
+	DNS_HOST_TYPE_ODHCPD = 2,
 } dns_hosts_type;
 
 struct dns_hosts {
@@ -556,6 +585,7 @@ struct dns_bind_ip {
 	const char *ssl_cert_key_pass;
 	const char *group;
 	struct nftset_ipset_rules nftset_ipset_rule;
+	char alpn[DNS_MAX_ALPN_LEN];
 };
 
 struct dns_domain_set_rule {
@@ -645,16 +675,10 @@ struct dns_srv_record {
 	unsigned short port;
 };
 
-struct dns_srv_records {
-	char domain[DNS_MAX_CNAME_LEN];
-	struct hlist_node node;
+struct dns_txt_record {
 	struct list_head list;
+	char text[DNS_MAX_CNAME_LEN];
 };
-
-struct dns_srv_record_table {
-	DECLARE_HASHTABLE(srv, 4);
-};
-extern struct dns_srv_record_table dns_conf_srv_record_table;
 
 struct dns_conf_plugin {
 	struct hlist_node node;
@@ -665,15 +689,9 @@ struct dns_conf_plugin {
 	int args_len;
 };
 
-struct dns_conf_plugin_conf {
-	struct hlist_node node;
-	char key[MAX_KEY_LEN];
-	char value[MAX_LINE_LEN];
-};
-
 struct dns_conf_plugin_table {
 	DECLARE_HASHTABLE(plugins, 4);
-	DECLARE_HASHTABLE(plugins_conf, 4);
+	art_tree plugins_conf;
 };
 extern struct dns_conf_plugin_table dns_conf_plugin_table;
 extern char dns_conf_exist_bootstrap_dns;
@@ -686,8 +704,10 @@ struct dns_config {
 	char bind_ca_file[DNS_MAX_PATH];
 	char bind_ca_key_file[DNS_MAX_PATH];
 	char bind_root_ca_key_file[DNS_MAX_PATH];
+	char bind_cert_san[DNS_MAX_PATH];
 	char bind_ca_key_pass[DNS_MAX_PATH];
-	int  bind_ca_validity_days;
+	int bind_ca_validity_days;
+	int bind_cert_generate;
 	char need_cert;
 	int tcp_idle_time;
 	ssize_t cachesize;
@@ -721,6 +741,7 @@ struct dns_config {
 	struct dns_domain_check_orders default_check_orders;
 	int has_icmp_check;
 	int has_tcp_check;
+	int has_tcp_syn_check;
 
 	struct dns_server_groups server_groups[DNS_NAX_GROUP_NUMBER];
 	int server_group_num;
@@ -772,7 +793,6 @@ int dns_server_check_update_hosts(void);
 
 struct dns_proxy_names *dns_server_get_proxy_names(const char *proxyname);
 
-struct dns_srv_records *dns_server_get_srv_record(const char *domain);
 
 struct dns_conf_group *dns_server_get_rule_group(const char *group_name);
 

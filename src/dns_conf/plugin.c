@@ -18,10 +18,17 @@
 
 #include "plugin.h"
 #include "smartdns/lib/stringutil.h"
+#include "smartdns/util.h"
 
 #include <stdio.h>
 
 struct dns_conf_plugin_table dns_conf_plugin_table;
+
+static int _config_plugin_iter_free(void *data, const unsigned char *key, uint32_t key_len, void *value)
+{
+	free(value);
+	return 0;
+}
 
 static struct dns_conf_plugin *_config_get_plugin(const char *file)
 {
@@ -41,32 +48,13 @@ static struct dns_conf_plugin *_config_get_plugin(const char *file)
 	return NULL;
 }
 
-static struct dns_conf_plugin_conf *_config_get_plugin_conf(const char *key)
-{
-	uint32_t hash = 0;
-	struct dns_conf_plugin_conf *conf = NULL;
-
-	hash = hash_string(key);
-	hash_for_each_possible(dns_conf_plugin_table.plugins_conf, conf, node, hash)
-	{
-		if (strncmp(conf->key, key, DNS_MAX_PATH) != 0) {
-			continue;
-		}
-
-		return conf;
-	}
-
-	return NULL;
-}
-
 const char *dns_conf_get_plugin_conf(const char *key)
 {
-	struct dns_conf_plugin_conf *conf = _config_get_plugin_conf(key);
-	if (conf == NULL) {
+	if (key == NULL) {
 		return NULL;
 	}
 
-	return conf->value;
+	return art_search(&dns_conf_plugin_table.plugins_conf, (unsigned char *)key, strlen(key) + 1);
 }
 
 int _config_plugin(void *data, int argc, char *argv[])
@@ -143,11 +131,10 @@ int _config_plugin(void *data, int argc, char *argv[])
 		goto errout;
 	}
 
-	plugin = malloc(sizeof(*plugin));
+	plugin = zalloc(1, sizeof(*plugin));
 	if (plugin == NULL) {
 		goto errout;
 	}
-	memset(plugin, 0, sizeof(*plugin));
 	safe_strncpy(plugin->file, file, sizeof(plugin->file) - 1);
 	ptr = plugin->args;
 	ptr_end = plugin->args + sizeof(plugin->args) - 2;
@@ -168,27 +155,25 @@ errout:
 
 int _config_plugin_conf_add(const char *key, const char *value)
 {
-	uint32_t hash = 0;
-	struct dns_conf_plugin_conf *conf = NULL;
-
+	char *old_value = NULL;
+	char *new_value = NULL;
 	if (key == NULL || value == NULL) {
-		tlog(TLOG_ERROR, "invalid parameter.");
 		goto errout;
 	}
 
-	conf = _config_get_plugin_conf(key);
-	if (conf == NULL) {
-
-		hash = hash_string(key);
-		conf = malloc(sizeof(*conf));
-		if (conf == NULL) {
-			goto errout;
-		}
-		memset(conf, 0, sizeof(*conf));
-		safe_strncpy(conf->key, key, sizeof(conf->key) - 1);
-		hash_add(dns_conf_plugin_table.plugins_conf, &conf->node, hash);
+	if (key[0] == '\0' || value[0] == '\0') {
+		goto errout;
 	}
-	safe_strncpy(conf->value, value, sizeof(conf->value) - 1);
+
+	new_value = strdup(value);
+	if (new_value == NULL) {
+		goto errout;
+	}
+
+	old_value = art_insert(&dns_conf_plugin_table.plugins_conf, (unsigned char *)key, strlen(key) + 1, new_value);
+	if (old_value) {
+		free(old_value);
+	}
 
 	return 0;
 
@@ -199,7 +184,7 @@ errout:
 void _config_plugin_table_init(void)
 {
 	hash_init(dns_conf_plugin_table.plugins);
-	hash_init(dns_conf_plugin_table.plugins_conf);
+	art_tree_init(&dns_conf_plugin_table.plugins_conf);
 }
 
 void _config_plugin_table_destroy(void)
@@ -217,15 +202,8 @@ void _config_plugin_table_destroy(void)
 
 void _config_plugin_table_conf_destroy(void)
 {
-	struct dns_conf_plugin_conf *plugin_conf = NULL;
-	struct hlist_node *tmp = NULL;
-	unsigned long i = 0;
-
-	hash_for_each_safe(dns_conf_plugin_table.plugins_conf, i, tmp, plugin_conf, node)
-	{
-		hlist_del_init(&plugin_conf->node);
-		free(plugin_conf);
-	}
+	art_iter(&dns_conf_plugin_table.plugins_conf, _config_plugin_iter_free, NULL);
+	art_tree_destroy(&dns_conf_plugin_table.plugins_conf);
 }
 
 void dns_conf_clear_all_plugin_conf(void)

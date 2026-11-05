@@ -20,10 +20,190 @@
 #include "http_parse.h"
 #include "qpack.h"
 
+#include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+
+#ifdef WITH_ZLIB
+#include <zlib.h>
+#endif
 
 #define HTTP3_HEADER_FRAME 1
 #define HTTP3_DATA_FRAME 0
+#define HTTP3_MAX_DECOMPRESSED_SIZE (1024 * 1024)
+
+static int _http3_get_expected_data_len(struct http_head *http_head, int *expect_data_len)
+{
+	const char *content_len = NULL;
+	char *endptr = NULL;
+	long expect_len = 0;
+
+	if (expect_data_len == NULL) {
+		return -1;
+	}
+
+	*expect_data_len = -1;
+	if (http_head == NULL) {
+		return -1;
+	}
+
+	content_len = http_head_get_fields_value(http_head, "content-length");
+	if (content_len == NULL || content_len[0] == '\0') {
+		return 0;
+	}
+
+	expect_len = strtol(content_len, &endptr, 10);
+	if (endptr == NULL || *endptr != '\0' || expect_len < 0 || expect_len > INT_MAX) {
+		return -1;
+	}
+
+	*expect_data_len = (int)expect_len;
+	return 0;
+}
+
+static int _http3_decompress_data(const uint8_t *compressed, int compressed_len, uint8_t **decompressed,
+								  int *decompressed_len, int is_gzip)
+{
+#ifdef WITH_ZLIB
+	z_stream strm;
+	int ret = Z_OK;
+	int window_bits = is_gzip ? (15 + 16) : 15;
+	int out_size = compressed_len * 4;
+	uint8_t *out_buf = NULL;
+
+	if (compressed == NULL || compressed_len <= 0 || decompressed == NULL || decompressed_len == NULL) {
+		return -2;
+	}
+
+	if (out_size < 8192) {
+		out_size = 8192;
+	}
+	if (out_size > HTTP3_MAX_DECOMPRESSED_SIZE) {
+		out_size = HTTP3_MAX_DECOMPRESSED_SIZE;
+	}
+
+	out_buf = malloc(out_size);
+	if (out_buf == NULL) {
+		return -3;
+	}
+
+	memset(&strm, 0, sizeof(strm));
+	strm.avail_in = compressed_len;
+	strm.next_in = (Bytef *)compressed;
+
+	ret = inflateInit2(&strm, window_bits);
+	if (ret != Z_OK) {
+		free(out_buf);
+		return -2;
+	}
+
+	while (ret != Z_STREAM_END) {
+		if ((int)strm.total_out == out_size) {
+			int new_size = out_size * 2;
+			uint8_t *new_buf = NULL;
+
+			if (new_size <= out_size || new_size > HTTP3_MAX_DECOMPRESSED_SIZE) {
+				inflateEnd(&strm);
+				free(out_buf);
+				return -3;
+			}
+
+			new_buf = realloc(out_buf, new_size);
+			if (new_buf == NULL) {
+				inflateEnd(&strm);
+				free(out_buf);
+				return -3;
+			}
+
+			out_buf = new_buf;
+			out_size = new_size;
+		}
+
+		strm.avail_out = out_size - strm.total_out;
+		strm.next_out = out_buf + strm.total_out;
+
+		ret = inflate(&strm, Z_NO_FLUSH);
+		if (ret == Z_STREAM_END) {
+			break;
+		}
+
+		if (ret == Z_BUF_ERROR || (ret == Z_OK && strm.avail_in == 0 && strm.avail_out > 0)) {
+			inflateEnd(&strm);
+			free(out_buf);
+			return -1;
+		}
+
+		if (ret != Z_OK) {
+			inflateEnd(&strm);
+			free(out_buf);
+			return -2;
+		}
+	}
+
+	*decompressed = out_buf;
+	*decompressed_len = strm.total_out;
+	inflateEnd(&strm);
+	return 0;
+#else
+	return -2;
+#endif
+}
+
+static int _http3_decode_content_encoding(struct http_head *http_head)
+{
+	const char *content_encoding = NULL;
+	uint8_t *decompressed = NULL;
+	int decompressed_len = 0;
+	int is_gzip = 0;
+	int ret = 0;
+	int data_offset = 0;
+	int data_end_offset = 0;
+
+	if (http_head == NULL || http_head->data == NULL || http_head->data_len <= 0) {
+		return 0;
+	}
+
+	content_encoding = http_head_get_fields_value(http_head, "content-encoding");
+	if (content_encoding == NULL || content_encoding[0] == '\0') {
+		return 0;
+	}
+
+	is_gzip = strcasecmp(content_encoding, "gzip") == 0;
+	if (!is_gzip && strcasecmp(content_encoding, "deflate") != 0) {
+		return 0;
+	}
+
+	ret = _http3_decompress_data(http_head->data, http_head->data_len, &decompressed, &decompressed_len, is_gzip);
+	if (ret != 0) {
+		return ret;
+	}
+
+	data_offset = http_head->data - http_head->buff;
+	data_end_offset = data_offset + http_head->data_len;
+	if (data_offset < 0 || data_offset > http_head->buff_size || decompressed_len > http_head->buff_size - data_offset) {
+		free(decompressed);
+		return -3;
+	}
+
+	if (data_end_offset == http_head->buff_len) {
+		memcpy(http_head->buff + data_offset, decompressed, decompressed_len);
+		http_head->buff_len = data_offset + decompressed_len;
+		http_head->data = http_head->buff + data_offset;
+	} else {
+		if (_http_head_buffer_left_len(http_head) < decompressed_len) {
+			free(decompressed);
+			return -3;
+		}
+		http_head->data = _http_head_buffer_get_end(http_head);
+		_http_head_buffer_append(http_head, decompressed, decompressed_len);
+	}
+	http_head->data_len = decompressed_len;
+
+	free(decompressed);
+	return 0;
+}
 
 static int _quicvarint_encode(uint64_t value, uint8_t *buffer, int buffer_size)
 {
@@ -178,7 +358,7 @@ static int _http3_build_headers_payload(struct http_head *http_head, uint8_t *bu
 		offset += offset_ret;
 	} else if (http_head->head_type == HTTP_HEAD_RESPONSE) {
 		char status_str[12];
-		sprintf(status_str, "%d", http_head->code);
+		snprintf(status_str, sizeof(status_str), "%d", http_head->code);
 		offset_ret = _qpack_build_header(":status", status_str, buffer + offset, buffer_len - offset);
 		if (offset_ret < 0) {
 			return -1;
@@ -197,7 +377,7 @@ static int _http3_build_headers_payload(struct http_head *http_head, uint8_t *bu
 
 	if (http_head->data_len > 0 && http_head->data) {
 		char len_str[12];
-		sprintf(len_str, "%d", http_head->data_len);
+		snprintf(len_str, sizeof(len_str), "%d", http_head->data_len);
 		offset_ret = _qpack_build_header("content-length", len_str, buffer + offset, buffer_len - offset);
 		if (offset_ret < 0) {
 			return -1;
@@ -308,6 +488,10 @@ static int _quic_read_string(const uint8_t *buffer, int buffer_len, char *str, i
 	uint64_t len = 0;
 	int offset = 0;
 	int offset_ret = 0;
+
+	if (buffer == NULL || str == NULL || str_len == NULL || max_str_len < 0) {
+		return -3;
+	}
 
 	offset_ret = _quic_read_varint(buffer, buffer_len, &len, n);
 	if (offset_ret < 0) {
@@ -544,6 +728,7 @@ int http_head_parse_http3_0(struct http_head *http_head, const uint8_t *data, in
 	uint64_t frame_len = 0;
 	int offset = 0;
 	int offset_ret = 0;
+	int expect_data_len = -1;
 
 	http_head->data_len = 0;
 	while (offset < data_len) {
@@ -578,6 +763,10 @@ int http_head_parse_http3_0(struct http_head *http_head, const uint8_t *data, in
 				return -1;
 			}
 
+			if (_http3_get_expected_data_len(http_head, &expect_data_len) != 0) {
+				return -2;
+			}
+
 		} else if (frame_type == HTTP3_DATA_FRAME) {
 			if (http_head->code != 200 && http_head->head_type == HTTP_HEAD_RESPONSE) {
 				if (frame_len > (uint64_t)(http_head->buff_size - http_head->buff_len)) {
@@ -600,7 +789,6 @@ int http_head_parse_http3_0(struct http_head *http_head, const uint8_t *data, in
 					http_head->buff_len = 0;
 					return -3;
 				}
-				memcpy(http_head->buff + http_head->buff_len, data + offset, frame_len);
 				http_head->data_len += frame_len;
 			}
 		} else {
@@ -609,6 +797,21 @@ int http_head_parse_http3_0(struct http_head *http_head, const uint8_t *data, in
 			continue;
 		}
 		offset += frame_len;
+	}
+
+	if (expect_data_len >= 0) {
+		if (http_head->data_len < expect_data_len) {
+			return -1;
+		}
+
+		if (http_head->data_len > expect_data_len) {
+			return -2;
+		}
+	}
+
+	offset_ret = _http3_decode_content_encoding(http_head);
+	if (offset_ret < 0) {
+		return offset_ret;
 	}
 
 	if (offset >= http_head->buff_size) {
@@ -624,31 +827,52 @@ int http_head_serialize_http3_0(struct http_head *http_head, uint8_t *buffer, in
 {
 	int offset = 0;
 	int offset_ret = 0;
-	uint8_t header_data[1024];
+	uint8_t *header_data = NULL;
+	int header_data_size = 1024;
 	int header_data_len = 0;
+	int result = -1;
+
+	header_data = malloc(header_data_size);
+	if (!header_data) {
+		goto cleanup;
+	}
 
 	/* serialize header frame. */
-	header_data_len = _http3_build_headers_payload(http_head, header_data, sizeof(header_data));
+	header_data_len = _http3_build_headers_payload(http_head, header_data, header_data_size);
 	if (header_data_len < 0) {
-		return -1;
+		goto cleanup;
+	}
+
+	/* If header_data_len > header_data_size, realloc */
+	if (header_data_len > header_data_size) {
+		uint8_t *new_header_data = realloc(header_data, header_data_len);
+		if (!new_header_data) {
+			goto cleanup;
+		}
+		header_data = new_header_data;
+		header_data_size = header_data_len;
+		header_data_len = _http3_build_headers_payload(http_head, header_data, header_data_size);
+		if (header_data_len < 0) {
+			goto cleanup;
+		}
 	}
 
 	/* Frame Type: Header*/
 	offset_ret = _quicvarint_encode(HTTP3_HEADER_FRAME, buffer + offset, buffer_len - offset);
 	if (offset_ret < 0) {
-		return -1;
+		goto cleanup;
 	}
 	offset += offset_ret;
 
-	/* Header Frmae Length */
+	/* Header Frame Length */
 	offset_ret = _quicvarint_encode(header_data_len, buffer + offset, buffer_len - offset);
 	if (offset_ret < 0) {
-		return -1;
+		goto cleanup;
 	}
 	offset += offset_ret;
 
 	if (buffer_len - offset < header_data_len) {
-		return -1;
+		goto cleanup;
 	}
 	memcpy(buffer + offset, header_data, header_data_len);
 	offset += header_data_len;
@@ -658,17 +882,23 @@ int http_head_serialize_http3_0(struct http_head *http_head, uint8_t *buffer, in
 		/* Data Frame Length */
 		offset_ret = _quicvarint_encode(HTTP3_DATA_FRAME, buffer + offset, buffer_len - offset);
 		if (offset_ret < 0) {
-			return -1;
+			goto cleanup;
 		}
 		offset += offset_ret;
 
 		offset_ret =
 			http3_build_body_payload(http_head->data, http_head->data_len, buffer + offset, buffer_len - offset);
 		if (offset_ret < 0) {
-			return -1;
+			goto cleanup;
 		}
 		offset += offset_ret;
 	}
 
-	return offset;
+	result = offset;
+
+cleanup:
+	if (header_data) {
+		free(header_data);
+	}
+	return result;
 }

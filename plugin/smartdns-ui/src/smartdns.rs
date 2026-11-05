@@ -30,6 +30,8 @@ use std::error::Error;
 use std::ffi::CString;
 use std::fmt;
 use std::os::raw::*;
+use std::ffi::CStr;
+use serde::Serialize;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -41,6 +43,7 @@ pub enum LogLevel {
     WARN = 3,
     ERROR = 4,
     FATAL = 5,
+    OFF = 6,
 }
 
 impl From<LogLevel> for u32 {
@@ -58,6 +61,7 @@ impl ToString for LogLevel {
             LogLevel::WARN => "warn".to_string(),
             LogLevel::ERROR => "error".to_string(),
             LogLevel::FATAL => "fatal".to_string(),
+            LogLevel::OFF => "off".to_string(),
         }
     }
 }
@@ -73,6 +77,7 @@ impl TryFrom<u32> for LogLevel {
             3 => Ok(LogLevel::WARN),
             4 => Ok(LogLevel::ERROR),
             5 => Ok(LogLevel::FATAL),
+            6 => Ok(LogLevel::OFF),
             _ => Err(()),
         }
     }
@@ -89,6 +94,7 @@ impl TryFrom<&str> for LogLevel {
             "warn" => Ok(LogLevel::WARN),
             "error" => Ok(LogLevel::ERROR),
             "fatal" => Ok(LogLevel::FATAL),
+            "off" => Ok(LogLevel::OFF),
             _ => Err(()),
         }
     }
@@ -953,6 +959,29 @@ impl Plugin {
         self.args = args;
         Ok(())
     }
+}
+
+#[derive(Serialize)]
+pub struct CachedDomainInfo { pub id: u64, pub domain: String, pub qtype: u16, pub cached_time: i64, pub ttl_remaining: i32 }
+
+extern "C" fn cache_foreach_cb(domain: *const c_char, qtype: u16, ttl_remaining: i32, insert_time: i64, userdata: *mut c_void) {
+    let domains = unsafe { &mut *(userdata as *mut Vec<CachedDomainInfo>) };
+    let domain_str = unsafe { CStr::from_ptr(domain).to_string_lossy().into_owned() };
+    domains.push(CachedDomainInfo { id: 0, domain: domain_str, qtype, cached_time: insert_time, ttl_remaining });
+}
+
+pub fn get_cached_domains() -> Vec<CachedDomainInfo> {
+    let mut domains: Vec<CachedDomainInfo> = Vec::new();
+    unsafe {
+        let count = smartdns_c::dns_cache_foreach(Some(cache_foreach_cb), &mut domains as *mut _ as *mut c_void);
+        if count < 0 {
+            return Vec::new();
+        }
+        for (idx, item) in domains.iter_mut().enumerate() {
+            item.id = (idx + 1) as u64;
+        }
+    }
+    domains
 }
 
 pub struct Stats {}

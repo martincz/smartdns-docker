@@ -30,6 +30,7 @@
 #include "ping_icmp.h"
 #include "ping_icmp6.h"
 #include "ping_tcp.h"
+#include "ping_tcp_syn.h"
 #include "ping_udp.h"
 #include "wakeup_event.h"
 
@@ -160,6 +161,8 @@ static int _fast_ping_sendping(struct ping_host_struct *ping_host)
 		ret = _fast_ping_sendping_v6(ping_host);
 	} else if (ping_host->type == FAST_PING_TCP) {
 		ret = _fast_ping_sendping_tcp(ping_host);
+	} else if (ping_host->type == FAST_PING_TCP_SYN) {
+		ret = _fast_ping_sendping_tcp_syn(ping_host);
 	} else if (ping_host->type == FAST_PING_UDP || ping_host->type == FAST_PING_UDP6) {
 		ret = _fast_ping_sendping_udp(ping_host);
 	}
@@ -202,6 +205,9 @@ int _fast_ping_get_addr_by_type(PING_TYPE type, const char *ip_str, int port, st
 	case PING_TYPE_TCP:
 		return _fast_ping_get_addr_by_tcp(ip_str, port, out_gai, out_ping_type);
 		break;
+	case PING_TYPE_TCP_SYN:
+		return _fast_ping_get_addr_by_tcp_syn(ip_str, port, out_gai, out_ping_type);
+		break;
 	case PING_TYPE_DNS:
 		return _fast_ping_get_addr_by_dns(ip_str, port, out_gai, out_ping_type);
 		break;
@@ -229,17 +235,19 @@ struct ping_host_struct *fast_ping_start(PING_TYPE type, const char *host, int c
 		goto errout;
 	}
 
+	if (timeout <= 0) {
+		timeout = 100;
+	}
+
 	ret = _fast_ping_get_addr_by_type(type, ip_str, port, &gai, &ping_type);
 	if (ret != 0) {
 		goto errout;
 	}
 
-	ping_host = malloc(sizeof(*ping_host));
+	ping_host = zalloc(1, sizeof(*ping_host));
 	if (ping_host == NULL) {
 		goto errout;
 	}
-
-	memset(ping_host, 0, sizeof(*ping_host));
 	safe_strncpy(ping_host->host, host, PING_MAX_HOSTLEN);
 	ping_host->fd = -1;
 	ping_host->timeout = timeout;
@@ -363,13 +371,16 @@ static int _fast_ping_process(struct ping_host_struct *ping_host, struct epoll_e
 	case FAST_PING_TCP:
 		ret = _fast_ping_process_tcp(ping_host, event, now);
 		break;
+	case FAST_PING_TCP_SYN:
+		ret = _fast_ping_process_tcp_syn(ping_host, now);
+		break;
 	case FAST_PING_UDP6:
 	case FAST_PING_UDP:
 		ret = _fast_ping_process_udp(ping_host, now);
 		break;
 	default:
-		tlog(TLOG_ERROR, "BUG: type error : %p, %d, %s, %d", ping_host, ping_host->sid, ping_host->host, ping_host->fd);
-		abort();
+
+		BUG("type error : %p, %d, %s, %d", ping_host, ping_host->sid, ping_host->host, ping_host->fd);
 		break;
 	}
 
@@ -425,7 +436,7 @@ static void _fast_ping_period_run(void)
 		}
 
 		if (millisecond < ping_host->interval) {
-			list_del(&ping_host->action_list);
+			list_del_init(&ping_host->action_list);
 			_fast_ping_host_put(ping_host);
 			continue;
 		}
@@ -433,7 +444,7 @@ static void _fast_ping_period_run(void)
 		if (ping_host->count > 0) {
 			if (ping_host->count == 1) {
 				_fast_ping_host_remove(ping_host);
-				list_del(&ping_host->action_list);
+				list_del_init(&ping_host->action_list);
 				_fast_ping_host_put(ping_host);
 				continue;
 			}
@@ -441,7 +452,7 @@ static void _fast_ping_period_run(void)
 		}
 
 		_fast_ping_sendping(ping_host);
-		list_del(&ping_host->action_list);
+		list_del_init(&ping_host->action_list);
 		_fast_ping_host_put(ping_host);
 	}
 }
@@ -452,43 +463,36 @@ static void *_fast_ping_work(void *arg)
 	int num = 0;
 	int i = 0;
 	unsigned long now = {0};
-	unsigned long last = {0};
 	struct timeval tvnow = {0};
 	int sleep = 100;
 	int sleep_time = 0;
 	unsigned long expect_time = 0;
+	unsigned long start_time = 0;
 
 	setpriority(PRIO_PROCESS, 0, -5);
 
-	sleep_time = sleep;
-	now = get_tick_count() - sleep;
-	last = now;
+	now = get_tick_count();
+	start_time = now;
 	expect_time = now + sleep;
+	
 	while (atomic_read(&ping.run)) {
 		now = get_tick_count();
-		if (sleep_time > 0) {
-			sleep_time -= now - last;
-			if (sleep_time <= 0) {
-				sleep_time = 0;
-			}
-		}
-
+		
 		if (now >= expect_time) {
-			if (last != now) {
-				_fast_ping_period_run();
-			}
-			sleep_time = sleep - (now - expect_time);
-			if (sleep_time < 0) {
-				sleep_time = 0;
-				expect_time = now;
-			}
-			expect_time += sleep;
+			_fast_ping_period_run();
+			unsigned long elapsed_from_start = now - start_time;
+			unsigned long next_period = (elapsed_from_start / sleep) + 1;
+			expect_time = start_time + next_period * sleep;
 		}
-		last = now;
+		
+		sleep_time = (int)(expect_time - now);
+		if (sleep_time < 0) {
+			sleep_time = 0;
+		}
 
 		pthread_mutex_lock(&ping.map_lock);
 		if (hash_empty(ping.addrmap)) {
-			sleep_time = -1;
+			sleep_time = -1; 
 		}
 		pthread_mutex_unlock(&ping.map_lock);
 
@@ -499,7 +503,9 @@ static void *_fast_ping_work(void *arg)
 		}
 
 		if (sleep_time == -1) {
-			expect_time = get_tick_count();
+			now = get_tick_count();
+			start_time = now;
+			expect_time = now + sleep;
 		}
 
 		if (num == 0) {
@@ -510,7 +516,7 @@ static void *_fast_ping_work(void *arg)
 		for (i = 0; i < num; i++) {
 			struct epoll_event *event = &events[i];
 			/* read event */
-			if (event->data.fd == ping.event_fd) {
+			if (event->data.ptr == NULL) {
 				uint64_t value;
 				int unused __attribute__((unused));
 				unused = read(ping.event_fd, &value, sizeof(uint64_t));
@@ -526,6 +532,19 @@ static void *_fast_ping_work(void *arg)
 	ping.epoll_fd = -1;
 
 	return NULL;
+}
+
+static void _fast_ping_stop_notify_worker(void)
+{
+	void *retval = NULL;
+
+	pthread_mutex_lock(&ping.notify_lock);
+	atomic_set(&ping.run, 0);
+	pthread_cond_signal(&ping.notify_cond);
+	pthread_mutex_unlock(&ping.notify_lock);
+
+	pthread_join(ping.notify_tid, &retval);
+	ping.notify_tid = 0;
 }
 
 int fast_ping_init(void)
@@ -588,11 +607,7 @@ int fast_ping_init(void)
 	return 0;
 errout:
 	if (ping.notify_tid) {
-		void *retval = NULL;
-		atomic_set(&ping.run, 0);
-		pthread_cond_signal(&ping.notify_cond);
-		pthread_join(ping.notify_tid, &retval);
-		ping.notify_tid = 0;
+		_fast_ping_stop_notify_worker();
 	}
 
 	if (ping.tid) {
@@ -624,25 +639,9 @@ errout:
 
 static void _fast_ping_close_fds(void)
 {
-	if (ping.fd_icmp > 0) {
-		close(ping.fd_icmp);
-		ping.fd_icmp = -1;
-	}
-
-	if (ping.fd_icmp6 > 0) {
-		close(ping.fd_icmp6);
-		ping.fd_icmp6 = -1;
-	}
-
-	if (ping.fd_udp > 0) {
-		close(ping.fd_udp);
-		ping.fd_udp = -1;
-	}
-
-	if (ping.fd_udp6 > 0) {
-		close(ping.fd_udp6);
-		ping.fd_udp6 = -1;
-	}
+	_fast_ping_close_icmp();
+	_fast_ping_close_udp();
+	_fast_ping_close_tcp_syn();
 }
 
 void fast_ping_exit(void)
@@ -652,11 +651,7 @@ void fast_ping_exit(void)
 	}
 
 	if (ping.notify_tid) {
-		void *retval = NULL;
-		atomic_set(&ping.run, 0);
-		pthread_cond_signal(&ping.notify_cond);
-		pthread_join(ping.notify_tid, &retval);
-		ping.notify_tid = 0;
+		_fast_ping_stop_notify_worker();
 	}
 
 	if (ping.tid) {

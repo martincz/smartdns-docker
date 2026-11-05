@@ -23,8 +23,51 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <openssl/pem.h>
 #include <openssl/rand.h>
+#include <openssl/x509v3.h>
 #include <sys/socket.h>
+
+static bool cert_has_san(const char *path, int type, const char *value)
+{
+	BIO *bio = BIO_new_file(path, "r");
+	if (bio == nullptr) {
+		return false;
+	}
+
+	X509 *cert = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr);
+	BIO_free(bio);
+	if (cert == nullptr) {
+		return false;
+	}
+
+	GENERAL_NAMES *names = (GENERAL_NAMES *)X509_get_ext_d2i(cert, NID_subject_alt_name, nullptr, nullptr);
+	bool found = false;
+	if (names != nullptr) {
+		for (int i = 0; i < sk_GENERAL_NAME_num(names) && !found; i++) {
+			const GENERAL_NAME *name = sk_GENERAL_NAME_value(names, i);
+			if (name->type != type) {
+				continue;
+			}
+
+			if (type == GEN_DNS) {
+				const ASN1_IA5STRING *dns = name->d.dNSName;
+				found = ASN1_STRING_length(dns) == (int)strlen(value) &&
+						memcmp(ASN1_STRING_get0_data(dns), value, strlen(value)) == 0;
+			} else if (type == GEN_IPADD) {
+				unsigned char addr[16] = {0};
+				int addr_len = inet_pton(AF_INET, value, addr) == 1 ? 4 : inet_pton(AF_INET6, value, addr) == 1 ? 16 : 0;
+				const ASN1_OCTET_STRING *ip = name->d.iPAddress;
+				found = addr_len > 0 && ASN1_STRING_length(ip) == addr_len &&
+						memcmp(ASN1_STRING_get0_data(ip), addr, addr_len) == 0;
+			}
+		}
+		GENERAL_NAMES_free(names);
+	}
+
+	X509_free(cert);
+	return found;
+}
 
 TEST(Bind, tls)
 {
@@ -72,6 +115,91 @@ address /example.com/1.2.3.4
 	ASSERT_EQ(client.GetAnswerNum(), 1);
 	EXPECT_EQ(client.GetStatus(), "NOERROR");
 	EXPECT_EQ(client.GetAnswer()[0].GetData(), "1.2.3.4");
+}
+
+TEST(Bind, tls_invalid_ca_file_fail_closed)
+{
+	Defer
+	{
+		unlink("/tmp/smartdns-cert.pem");
+		unlink("/tmp/smartdns-key.pem");
+	};
+
+	smartdns::Server server_wrap;
+	smartdns::Server server;
+
+	ASSERT_TRUE(server_wrap.Start(R"""(
+bind-tls [::]:60053
+address /example.com/1.2.3.4
+)"""));
+	if (server.Start(R"""(
+bind [::]:61053
+ca-file /nonexistent/smartdns-test-ca.pem
+server-tls 127.0.0.1:60053
+)""") == false) {
+		return;
+	}
+
+	smartdns::Client client;
+	ASSERT_FALSE(client.Query("example.com +time=1", 61053));
+}
+
+TEST(Bind, cert_auto_generate_explicit_path)
+{
+	const char *cert = "/tmp/smartdns-bind-auto-cert.pem";
+	const char *key = "/tmp/smartdns-bind-auto-key.pem";
+	const char *root_key = "/tmp/smartdns-bind-auto-root-key.pem";
+
+	Defer
+	{
+		unlink(cert);
+		unlink(key);
+		unlink(root_key);
+	};
+
+	unlink(cert);
+	unlink(key);
+	unlink(root_key);
+
+	smartdns::Server server;
+	ASSERT_TRUE(server.Start(R"""(
+bind-cert-generate yes
+bind-cert-san router.lan 192.168.1.1
+bind-cert-file /tmp/smartdns-bind-auto-cert.pem
+bind-cert-key-file /tmp/smartdns-bind-auto-key.pem
+bind-cert-root-key-file /tmp/smartdns-bind-auto-root-key.pem
+bind-tls [::]:60053
+)"""));
+
+	EXPECT_EQ(access(cert, F_OK), 0);
+	EXPECT_EQ(access(key, F_OK), 0);
+	EXPECT_EQ(access(root_key, F_OK), 0);
+	EXPECT_TRUE(cert_has_san(cert, GEN_DNS, "router.lan"));
+	EXPECT_TRUE(cert_has_san(cert, GEN_IPADD, "192.168.1.1"));
+}
+
+TEST(Bind, cert_explicit_path_without_auto_generate_skips_generation)
+{
+	const char *cert = "/tmp/smartdns-bind-manual-cert.pem";
+	const char *key = "/tmp/smartdns-bind-manual-key.pem";
+
+	Defer
+	{
+		unlink(cert);
+		unlink(key);
+	};
+
+	unlink(cert);
+	unlink(key);
+
+	smartdns::Server server;
+	ASSERT_TRUE(server.Start(R"""(
+bind-cert-file /tmp/smartdns-bind-manual-cert.pem
+bind-cert-key-file /tmp/smartdns-bind-manual-key.pem
+bind-tls [::]:60053
+)"""));
+	EXPECT_NE(access(cert, F_OK), 0);
+	EXPECT_NE(access(key, F_OK), 0);
 }
 
 TEST(Bind, udp_tcp)
@@ -163,7 +291,7 @@ server 127.0.0.1:61053
 	ASSERT_EQ(client.GetAnswerNum(), 1);
 	EXPECT_EQ(client.GetStatus(), "NOERROR");
 	EXPECT_EQ(client.GetAnswer()[0].GetName(), "a.com");
-	EXPECT_EQ(client.GetAnswer()[0].GetTTL(), 3);
+	EXPECT_EQ(client.GetAnswer()[0].GetTTL(), 611);
 	EXPECT_EQ(client.GetAnswer()[0].GetData(), "1.2.3.4");
 
 	ASSERT_TRUE(client.Query("a.com", 60053));
@@ -172,7 +300,7 @@ server 127.0.0.1:61053
 	ASSERT_EQ(client.GetAnswerNum(), 1);
 	EXPECT_EQ(client.GetStatus(), "NOERROR");
 	EXPECT_EQ(client.GetAnswer()[0].GetName(), "a.com");
-	EXPECT_EQ(client.GetAnswer()[0].GetTTL(), 3);
+	EXPECT_EQ(client.GetAnswer()[0].GetTTL(), 611);
 	EXPECT_EQ(client.GetAnswer()[0].GetData(), "1.2.3.4");
 }
 
@@ -319,4 +447,25 @@ server 127.0.0.1:63053 -group g2 -exclude-default-group
 	EXPECT_EQ(client.GetStatus(), "NOERROR");
 	EXPECT_EQ(client.GetAnswer()[0].GetName(), "a.com");
 	EXPECT_EQ(client.GetAnswer()[0].GetData(), "5.6.7.8");
+}
+
+TEST(Bind, Get)
+{
+    smartdns::Server server;
+
+	int ret = system("which curl > /dev/null 2>&1");
+	if (ret != 0) {
+		GTEST_SKIP() << "curl not found, skip test";
+	}
+
+    // Start server with bind-https and logging to file
+    server.Start(R"""(bind-https [::]:60053 -alpn h2
+address /example.com/1.2.3.4
+log-level debug
+)""");
+
+    // Send GET request using curl
+    std::string cmd = "curl -k --http2 'https://127.0.0.1:60053/dns-query?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE=' > /dev/null 2>&1";
+    ret = system(cmd.c_str());
+    ASSERT_EQ(ret, 0);
 }

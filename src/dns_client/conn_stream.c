@@ -24,16 +24,15 @@ struct dns_conn_stream *_dns_client_conn_stream_new(void)
 {
 	struct dns_conn_stream *stream = NULL;
 
-	stream = malloc(sizeof(*stream));
+	stream = zalloc(1, sizeof(*stream));
 	if (stream == NULL) {
 		tlog(TLOG_ERROR, "malloc conn stream failed");
 		return NULL;
 	}
-
-	memset(stream, 0, sizeof(*stream));
 	INIT_LIST_HEAD(&stream->server_list);
 	INIT_LIST_HEAD(&stream->query_list);
 	stream->quic_stream = NULL;
+	stream->http2_stream = NULL;
 	stream->server_info = NULL;
 	stream->query = NULL;
 	atomic_set(&stream->refcnt, 1);
@@ -53,7 +52,7 @@ void _dns_client_conn_stream_put(struct dns_conn_stream *stream)
 	int refcnt = atomic_dec_return(&stream->refcnt);
 	if (refcnt) {
 		if (refcnt < 0) {
-			BUG("BUG: stream refcnt is %d", refcnt);
+			BUG("BUG: stream  %p, refcnt is %d", stream, refcnt);
 		}
 		return;
 	}
@@ -63,16 +62,23 @@ void _dns_client_conn_stream_put(struct dns_conn_stream *stream)
 		stream->quic_stream = NULL;
 	}
 
+	if (stream->http2_stream) {
+		struct http2_stream *http2_stream = stream->http2_stream;
+		stream->http2_stream = NULL;
+		http2_stream_close(http2_stream);
+		stream->server_info = NULL;
+	}
+
 	if (stream->query) {
+		pthread_mutex_lock(&stream->query->lock);
 		list_del_init(&stream->query_list);
+		pthread_mutex_unlock(&stream->query->lock);
 		stream->query = NULL;
 	}
 
 	if (stream->server_info) {
 		pthread_mutex_lock(&stream->server_info->lock);
-		if (!list_empty(&stream->server_list)) {
-			list_del_init(&stream->server_list);
-		}
+		list_del_init(&stream->server_list);
 		pthread_mutex_unlock(&stream->server_info->lock);
 	}
 
@@ -95,12 +101,18 @@ void _dns_client_conn_server_streams_free(struct dns_server_info *server_info, s
 		list_del_init(&stream->server_list);
 		stream->server_info = NULL;
 		if (stream->quic_stream) {
-#if defined(OSSL_QUIC1_VERSION) && !defined (OPENSSL_NO_QUIC)
+#if defined(OSSL_QUIC1_VERSION) && !defined(OPENSSL_NO_QUIC)
 			SSL_stream_reset(stream->quic_stream, NULL, 0);
 #endif
 			SSL_free(stream->quic_stream);
 			stream->quic_stream = NULL;
 		}
+
+		if (stream->http2_stream) {
+			http2_stream_close(stream->http2_stream);
+			stream->http2_stream = NULL;
+		}
+
 		_dns_client_conn_stream_put(stream);
 	}
 	pthread_mutex_unlock(&server_info->lock);

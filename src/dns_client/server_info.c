@@ -399,16 +399,15 @@ int _dns_client_server_add(const char *server_ip, const char *server_host, int p
 		goto errout;
 	}
 
-	server_info = malloc(sizeof(*server_info));
-	if (server_info == NULL) {
-		goto errout;
-	}
-
 	if (server_type != DNS_SERVER_UDP) {
 		flags->result_flag &= (~DNSSERVER_FLAG_CHECK_TTL);
 	}
 
-	memset(server_info, 0, sizeof(*server_info));
+	server_info = zalloc(1, sizeof(*server_info));
+	if (server_info == NULL) {
+		goto errout;
+	}
+
 	safe_strncpy(server_info->ip, server_ip, sizeof(server_info->ip));
 	server_info->port = port;
 	server_info->ai_family = gai->ai_family;
@@ -448,14 +447,6 @@ int _dns_client_server_add(const char *server_ip, const char *server_host, int p
 	if (_dns_client_server_add_ecs(server_info, flags) != 0) {
 		tlog(TLOG_ERROR, "add %s ecs failed.", server_ip);
 		goto errout;
-	}
-
-	/* exclude this server from default group */
-	if ((server_info->flags.server_flag & SERVER_FLAG_EXCLUDE_DEFAULT) == 0) {
-		if (_dns_client_add_to_group(DNS_SERVER_GROUP_DEFAULT, server_info) != 0) {
-			tlog(TLOG_ERROR, "add server %s to default group failed.", server_ip);
-			goto errout;
-		}
 	}
 
 	/* if server type is TLS, create ssl context */
@@ -508,6 +499,16 @@ int _dns_client_server_add(const char *server_ip, const char *server_host, int p
 
 	_dns_server_inc_server_num(server_info);
 	freeaddrinfo(gai);
+	gai = NULL;
+
+	/* exclude this server from default group */
+	if ((server_info->flags.server_flag & SERVER_FLAG_EXCLUDE_DEFAULT) == 0) {
+		if (_dns_client_add_to_group(DNS_SERVER_GROUP_DEFAULT, server_info) != 0) {
+			tlog(TLOG_ERROR, "add server %s to default group failed.", server_ip);
+			_dns_client_server_info_remove(server_info);
+			return -1;
+		}
+	}
 
 	if (flags->ifname[0]) {
 		snprintf(ifname, sizeof(ifname), "@%s", flags->ifname);

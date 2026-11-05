@@ -43,6 +43,8 @@
 #include "server_tcp.h"
 #include "server_tls.h"
 #include "server_udp.h"
+#include "server_http2.h"
+#include "server_http.h"
 #include "soa.h"
 #include "speed_check.h"
 
@@ -98,6 +100,10 @@ int _dns_reply_inpacket(struct dns_request *request, unsigned char *inpacket, in
 		ret = _dns_server_reply_tcp(request, (struct dns_server_conn_tcp_client *)conn, inpacket, inpacket_len);
 	} else if (conn->type == DNS_CONN_TYPE_HTTPS_CLIENT) {
 		ret = _dns_server_reply_https(request, (struct dns_server_conn_tcp_client *)conn, inpacket, inpacket_len);
+	} else if (conn->type == DNS_CONN_TYPE_HTTP_CLIENT) {
+		ret = _dns_server_reply_http(request, (struct dns_server_conn_tcp_client *)conn, inpacket, inpacket_len);
+	} else if (conn->type == DNS_CONN_TYPE_HTTP2_STREAM) {
+		ret = _dns_server_reply_http2(request, (struct dns_server_conn_http2_stream *)conn, inpacket, inpacket_len);
 	} else {
 		ret = -1;
 	}
@@ -558,10 +564,10 @@ static int _dns_server_process(struct dns_server_conn_head *conn, struct epoll_e
 	if (conn->type == DNS_CONN_TYPE_UDP_SERVER) {
 		struct dns_server_conn_udp *udpconn = (struct dns_server_conn_udp *)conn;
 		ret = _dns_server_process_udp(udpconn, event, now);
-	} else if (conn->type == DNS_CONN_TYPE_TCP_SERVER) {
+	} else if (conn->type == DNS_CONN_TYPE_TCP_SERVER || conn->type == DNS_CONN_TYPE_HTTP_SERVER) {
 		struct dns_server_conn_tcp_server *tcpserver = (struct dns_server_conn_tcp_server *)conn;
 		ret = _dns_server_tcp_accept(tcpserver, event, now);
-	} else if (conn->type == DNS_CONN_TYPE_TCP_CLIENT) {
+	} else if (conn->type == DNS_CONN_TYPE_TCP_CLIENT || conn->type == DNS_CONN_TYPE_HTTP_CLIENT) {
 		struct dns_server_conn_tcp_client *tcpclient = (struct dns_server_conn_tcp_client *)conn;
 		ret = _dns_server_process_tcp(tcpclient, event, now);
 		if (ret != 0) {
@@ -572,6 +578,7 @@ static int _dns_server_process(struct dns_server_conn_head *conn, struct epoll_e
 	} else if (conn->type == DNS_CONN_TYPE_TLS_SERVER || conn->type == DNS_CONN_TYPE_HTTPS_SERVER) {
 		struct dns_server_conn_tls_server *tls_server = (struct dns_server_conn_tls_server *)conn;
 		ret = _dns_server_tls_accept(tls_server, event, now);
+
 	} else if (conn->type == DNS_CONN_TYPE_TLS_CLIENT || conn->type == DNS_CONN_TYPE_HTTPS_CLIENT) {
 		struct dns_server_conn_tls_client *tls_client = (struct dns_server_conn_tls_client *)conn;
 		ret = _dns_server_process_tls(tls_client, event, now);
@@ -620,6 +627,11 @@ static int _dns_server_socket(void)
 			break;
 		case DNS_BIND_TYPE_TLS:
 			if (_dns_server_socket_tls(bind_ip, DNS_CONN_TYPE_TLS_SERVER) != 0) {
+				goto errout;
+			}
+			break;
+		case DNS_BIND_TYPE_HTTP:
+			if (_dns_server_socket_http(bind_ip) != 0) {
 				goto errout;
 			}
 			break;
@@ -695,7 +707,8 @@ static void _dns_server_period_run(unsigned int msec)
 			continue;
 		}
 
-		if (request->send_tick < now - (check_order * DNS_PING_CHECK_INTERVAL) && request->has_ping_result == 0) {
+		if ((request->send_tick < now - (check_order * DNS_PING_CHECK_INTERVAL) && request->has_ping_result == 0) ||
+			request->ping_time > DNS_PING_RTT_CHECK_THRESHOLD) {
 			_dns_server_request_get(request);
 			list_add_tail(&request->check_list, &check_list);
 			request->check_order++;
@@ -717,54 +730,46 @@ int dns_server_run(void)
 	int num = 0;
 	int i = 0;
 	unsigned long now = {0};
-	unsigned long last = {0};
 	unsigned int msec = 0;
 	int sleep = 100;
 	int sleep_time = 0;
 	unsigned long expect_time = 0;
+	unsigned long start_time = 0;
 
-	sleep_time = sleep;
-	now = get_tick_count() - sleep;
-	last = now;
+	now = get_tick_count();
+	start_time = now;
 	expect_time = now + sleep;
+
 	while (atomic_read(&server.run)) {
 		now = get_tick_count();
-		if (sleep_time > 0) {
-			sleep_time -= now - last;
-			if (sleep_time <= 0) {
-				sleep_time = 0;
-			}
-
-			int cnt = sleep_time / sleep;
-			msec -= cnt;
-			expect_time -= cnt * sleep;
-			sleep_time -= cnt * sleep;
-		}
 
 		if (now >= expect_time) {
+			unsigned long elapsed_from_start = now - start_time;
+			unsigned int current_period = (elapsed_from_start + sleep / 2) / sleep;
+
+			if (current_period > msec) {
+				msec = current_period;
+			}
+			expect_time = start_time + (msec + 1) * sleep;
+
+			_dns_server_period_run(msec);
 			msec++;
-			if (last != now) {
-				_dns_server_period_run(msec);
-			}
-			sleep_time = sleep - (now - expect_time);
-			if (sleep_time < 0) {
-				sleep_time = 0;
-				expect_time = now;
-			}
 
 			/* When server is idle, the sleep time is 1000ms, to reduce CPU usage */
 			pthread_mutex_lock(&server.request_list_lock);
 			if (list_empty(&server.request_list)) {
-				int cnt = 10 - (msec % 10) - 1;
-				sleep_time += sleep * cnt;
-				msec += cnt;
-				/* sleep to next second */
-				expect_time += sleep * cnt;
+				if (msec % 10 != 0) {
+					msec = ((msec / 10) + 1) * 10;
+					expect_time = start_time + msec * sleep;
+				}
 			}
 			pthread_mutex_unlock(&server.request_list_lock);
-			expect_time += sleep;
 		}
-		last = now;
+
+		sleep_time = (int)(expect_time - now);
+		if (sleep_time < 0) {
+			sleep_time = 0;
+		}
 
 		num = epoll_wait(server.epoll_fd, events, DNS_MAX_EVENTS, sleep_time);
 		if (num < 0) {
@@ -788,6 +793,12 @@ int dns_server_run(void)
 
 			if (unlikely(event->data.fd == server.local_addr_cache.fd_netlink)) {
 				_dns_server_process_local_addr_cache(event->data.fd, event, now);
+				continue;
+			}
+
+			/* neighbor table event */
+			if (unlikely(event->data.fd == server.neigh_netlink_fd)) {
+				_dns_server_process_neighbor_cache_event();
 				continue;
 			}
 
@@ -876,6 +887,7 @@ int dns_server_init(void)
 	}
 
 	memset(&server, 0, sizeof(server));
+	server.neigh_netlink_fd = -1;
 
 	pthread_mutexattr_init(&attr);
 	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);

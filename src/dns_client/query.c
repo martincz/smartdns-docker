@@ -52,12 +52,16 @@ void _dns_client_query_release(struct dns_query_struct *query)
 		query->callback(query->domain, DNS_QUERY_END, NULL, NULL, NULL, 0, query->user_ptr);
 	}
 
+	pthread_mutex_lock(&query->lock);
 	list_for_each_entry_safe(stream, stream_tmp, &query->conn_stream_list, query_list)
 	{
 		list_del_init(&stream->query_list);
 		stream->query = NULL;
 		_dns_client_conn_stream_put(stream);
 	}
+	pthread_mutex_unlock(&query->lock);
+
+	pthread_mutex_destroy(&query->lock);
 
 	/* free resource */
 	pthread_mutex_lock(&client.domain_map_lock);
@@ -196,51 +200,42 @@ struct dns_query_struct *_dns_client_get_request(char *domain, int qtype, unsign
 	return query_result;
 }
 
-int _dns_replied_check_add(struct dns_query_struct *dns_query, struct sockaddr *addr, socklen_t addr_len)
+int _dns_replied_check_add(struct dns_query_struct *dns_query, struct dns_server_info *server)
 {
 	uint32_t key = 0;
 	struct dns_query_replied *replied_map = NULL;
 
-	if (addr_len > sizeof(struct sockaddr_in6)) {
-		tlog(TLOG_ERROR, "addr length is invalid.");
-		return -1;
-	}
-
 	/* avoid multiple replies from one server */
-	key = jhash(addr, addr_len, 0);
+	key = jhash((const void *)&server, sizeof(server), 0);
 	hash_for_each_possible(dns_query->replied_map, replied_map, node, key)
 	{
 		/* already replied, ignore this reply */
-		if (memcmp(&replied_map->addr, addr, addr_len) == 0) {
+		if (replied_map->server == server) {
 			return -1;
 		}
 	}
 
-	replied_map = malloc(sizeof(*replied_map));
+	replied_map = zalloc(1, sizeof(*replied_map));
 	if (replied_map == NULL) {
 		tlog(TLOG_ERROR, "malloc failed");
 		return -1;
 	}
 
 	/* add address info to check hashtable */
-	memcpy(&replied_map->addr, addr, addr_len);
+	replied_map->server = server;
 	hash_add(dns_query->replied_map, &replied_map->node, key);
 	return 0;
 }
 
-void _dns_replied_check_remove(struct dns_query_struct *dns_query, struct sockaddr *addr, socklen_t addr_len)
+void _dns_replied_check_remove(struct dns_query_struct *dns_query, struct dns_server_info *server)
 {
 	uint32_t key = 0;
 	struct dns_query_replied *replied_map = NULL;
 
-	if (addr_len > sizeof(struct sockaddr_in6)) {
-		return;
-	}
-
-	key = jhash(addr, addr_len, 0);
+	key = jhash((const void *)&server, sizeof(server), 0);
 	hash_for_each_possible(dns_query->replied_map, replied_map, node, key)
 	{
-		if (memcmp(&replied_map->addr, addr, addr_len) == 0) {
+		if (replied_map->server == server) {
 			hash_del(&replied_map->node);
 			free(replied_map);
 			return;

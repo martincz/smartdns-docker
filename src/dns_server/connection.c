@@ -18,6 +18,9 @@
 
 #include "connection.h"
 #include "dns_server.h"
+#include "server_http2.h"
+
+#include "smartdns/http2.h"
 
 #include <openssl/ssl.h>
 #include <sys/epoll.h>
@@ -59,12 +62,23 @@ void _dns_server_conn_release(struct dns_server_conn_head *conn)
 			SSL_free(tls_client->ssl);
 			tls_client->ssl = NULL;
 		}
+
+		if (tls_client->http2_ctx != NULL) {
+			http2_ctx_put(tls_client->http2_ctx);
+			tls_client->http2_ctx = NULL;
+		}
 		pthread_mutex_destroy(&tls_client->ssl_lock);
 	} else if (conn->type == DNS_CONN_TYPE_TLS_SERVER || conn->type == DNS_CONN_TYPE_HTTPS_SERVER) {
 		struct dns_server_conn_tls_server *tls_server = (struct dns_server_conn_tls_server *)conn;
 		if (tls_server->ssl_ctx != NULL) {
 			SSL_CTX_free(tls_server->ssl_ctx);
 			tls_server->ssl_ctx = NULL;
+		}
+	} else if (conn->type == DNS_CONN_TYPE_HTTP2_STREAM) {
+		struct dns_server_conn_http2_stream *http2_stream = (struct dns_server_conn_http2_stream *)conn;
+		if (http2_stream->stream != NULL) {
+			http2_stream_close(http2_stream->stream);
+			http2_stream->stream = NULL;
 		}
 	}
 
@@ -95,10 +109,23 @@ void _dns_server_close_socket(void)
 	struct dns_server_conn_head *conn = NULL;
 	struct dns_server_conn_head *tmp = NULL;
 
+	pthread_mutex_lock(&server.conn_list_lock);
 	list_for_each_entry_safe(conn, tmp, &server.conn_list, list)
 	{
+		/* Force cleanup of TLS/HTTPS client connections to prevent memory leaks */
+		if (conn->type == DNS_CONN_TYPE_TLS_CLIENT || conn->type == DNS_CONN_TYPE_HTTPS_CLIENT) {
+			struct dns_server_conn_tls_client *tls_client = (struct dns_server_conn_tls_client *)conn;
+
+			/* Free SSL connection */
+			if (tls_client->ssl != NULL) {
+				SSL_free(tls_client->ssl);
+				tls_client->ssl = NULL;
+			}
+		}
+
 		_dns_server_client_close(conn);
 	}
+	pthread_mutex_unlock(&server.conn_list_lock);
 }
 
 void _dns_server_close_socket_server(void)
@@ -119,6 +146,7 @@ void _dns_server_close_socket_server(void)
 			_dns_server_client_close(conn);
 			break;
 		}
+		case DNS_CONN_TYPE_HTTP_SERVER:
 		case DNS_CONN_TYPE_UDP_SERVER:
 		case DNS_CONN_TYPE_TCP_SERVER:
 			_dns_server_client_close(conn);
@@ -144,6 +172,14 @@ int _dns_server_client_close(struct dns_server_conn_head *conn)
 	list_del_init(&conn->list);
 	pthread_mutex_unlock(&server.conn_list_lock);
 
+	if (conn->type == DNS_CONN_TYPE_TLS_CLIENT || conn->type == DNS_CONN_TYPE_HTTPS_CLIENT) {
+		struct dns_server_conn_tls_client *tls_client = (struct dns_server_conn_tls_client *)conn;
+		if (tls_client->http2_ctx != NULL) {
+			http2_ctx_close(tls_client->http2_ctx);
+			tls_client->http2_ctx = NULL;
+		}
+	}
+
 	_dns_server_conn_release(conn);
 
 	return 0;
@@ -160,7 +196,8 @@ int _dns_server_update_request_connection_timeout(struct dns_server_conn_head *c
 	}
 
 	switch (conn->type) {
-	case DNS_CONN_TYPE_TCP_CLIENT: {
+	case DNS_CONN_TYPE_TCP_CLIENT:
+	case DNS_CONN_TYPE_HTTP_CLIENT: {
 		struct dns_server_conn_tcp_client *tcpclient = (struct dns_server_conn_tcp_client *)conn;
 		tcpclient->conn_idle_timeout = timeout;
 	} break;

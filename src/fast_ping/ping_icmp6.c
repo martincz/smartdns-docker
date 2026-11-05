@@ -101,6 +101,10 @@ int _fast_ping_sendping_v6(struct ping_host_struct *ping_host)
 		case EACCES:
 		case EPERM:
 		case EAFNOSUPPORT:
+		case EAGAIN:
+#if EWOULDBLOCK != EAGAIN
+		case EWOULDBLOCK:
+#endif
 			goto errout;
 		default:
 			break;
@@ -150,6 +154,9 @@ struct fast_ping_packet *_fast_ping_icmp6_packet(struct ping_host_struct *ping_h
 				continue;
 			}
 			memcpy(&hops, CMSG_DATA(c), sizeof(hops));
+			break;
+		default:
+			break;
 		}
 	}
 

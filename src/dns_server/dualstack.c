@@ -37,6 +37,7 @@ void dns_server_check_ipv6_ready(void)
 	static int do_get_conf = 0;
 	static int is_icmp_check_set;
 	static int is_tcp_check_set;
+	static int is_tcp_syn_check_set;
 
 	if (do_get_conf == 0) {
 		if (dns_conf.has_icmp_check == 1) {
@@ -47,8 +48,16 @@ void dns_server_check_ipv6_ready(void)
 			is_tcp_check_set = 1;
 		}
 
+		if (dns_conf.has_tcp_syn_check == 1) {
+			is_tcp_syn_check_set = 1;
+		}
+
 		if (is_icmp_check_set == 0) {
 			tlog(TLOG_INFO, "ICMP ping is disabled, no ipv6 icmp check feature");
+		}
+
+		if (is_tcp_syn_check_set == 0) {
+			tlog(TLOG_INFO, "TCP-SYN ping is disabled, no ipv6 tcp-syn check feature");
 		}
 
 		do_get_conf = 1;
@@ -70,6 +79,20 @@ void dns_server_check_ipv6_ready(void)
 
 	if (is_tcp_check_set) {
 		struct ping_host_struct *check_ping = fast_ping_start(PING_TYPE_TCP, "2001::", 1, 0, 100, NULL, NULL);
+		if (check_ping) {
+			fast_ping_stop(check_ping);
+			is_ipv6_ready = 1;
+			return;
+		}
+
+		if (errno == EADDRNOTAVAIL) {
+			is_ipv6_ready = 0;
+			return;
+		}
+	}
+
+	if (is_tcp_syn_check_set) {
+		struct ping_host_struct *check_ping = fast_ping_start(PING_TYPE_TCP_SYN, "2001::", 1, 0, 100, NULL, NULL);
 		if (check_ping) {
 			fast_ping_stop(check_ping);
 			is_ipv6_ready = 1;
@@ -137,7 +160,26 @@ static void _dns_server_check_complete_dualstack(struct dns_request *request, st
 		return;
 	}
 
-	if (request->ping_time <= (request->conf->dns_dualstack_ip_selection_threshold * 10)) {
+	if (request->ping_time <= 0) {
+		return;
+	}
+
+	/* The paired request has not finished its speed test yet (ping_time == -1).
+	 * Only give up on it early when, even if it responded right now, its speed
+	 * could not come within the selection threshold of this request. The paired
+	 * request's eventual ping time is at least how long it has already been
+	 * probing, so use that elapsed time as its best-case speed. Otherwise wait
+	 * for its own speed test to complete, so the threshold comparison in
+	 * _dns_server_force_dualstack stays accurate.
+	 *
+	 * Without this, a request whose ping is still pending is forced to SOA based
+	 * only on this request's absolute ping time exceeding the threshold, which
+	 * makes dualstack-ip-selection-threshold ineffective when both addresses
+	 * respond at nearly the same time. */
+	unsigned long elapsed_ping_time = (get_tick_count() - dualstack_request->send_tick) * 10;
+	unsigned long threshold_ping_time =
+		(unsigned long)request->ping_time + (request->conf->dns_dualstack_ip_selection_threshold * 10);
+	if (elapsed_ping_time <= threshold_ping_time) {
 		return;
 	}
 

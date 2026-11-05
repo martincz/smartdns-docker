@@ -16,15 +16,29 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "http2_parse.h"
-#include "http_parse.h"
+#ifndef _FAST_PING_TCP_SYN_H_
+#define _FAST_PING_TCP_SYN_H_
 
-int http_head_parse_http2_0(struct http_head *http_head, const uint8_t *data, int data_len)
-{
-	return -2;
-}
+#include "fast_ping.h"
 
-int http_head_serialize_http2_0(struct http_head *http_head, uint8_t *buffer, int buffer_len)
-{
-	return -2;
+#include <sys/epoll.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif /*__cplusplus */
+
+int _fast_ping_process_tcp_syn(struct ping_host_struct *ping_host, struct timeval *now);
+
+int _fast_ping_get_addr_by_tcp_syn(const char *ip_str, int port, struct addrinfo **out_gai,
+								   FAST_PING_TYPE *out_ping_type);
+
+int _fast_ping_sendping_tcp_syn(struct ping_host_struct *ping_host);
+
+int _fast_ping_tcp_syn_create_socket(struct ping_host_struct *ping_host);
+
+void _fast_ping_close_tcp_syn(void);
+
+#ifdef __cplusplus
 }
+#endif /*__cplusplus */
+#endif // !_FAST_PING_TCP_SYN_H_

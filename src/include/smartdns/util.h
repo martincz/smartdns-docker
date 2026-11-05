@@ -21,6 +21,7 @@
 
 #include "smartdns/lib/stringutil.h"
 #include <netdb.h>
+#include <stdlib.h>
 #include <time.h>
 
 #ifdef __cplusplus
@@ -42,7 +43,7 @@ extern "C" {
 #define TCP_THIN_DUPACK 17
 #endif
 
-#define PORT_NOT_DEFINED -1
+#define PORT_NOT_DEFINED (-1)
 #define MAX_IP_LEN 64
 
 #define IPV6_ADDR_LEN 16
@@ -114,15 +115,19 @@ char *reverse_string(char *output, const char *input, int len, int to_lower_case
 
 char *to_lower_case(char *output, const char *input, int len);
 
-void print_stack(void);
-
 int ipset_add(const char *ipset_name, const unsigned char addr[], int addr_len, unsigned long timeout);
 
 int ipset_del(const char *ipset_name, const unsigned char addr[], int addr_len);
 
-int netlink_get_neighbors(int family,
+int netlink_get_neighbors(int family, const uint8_t *target_ip, int target_ip_len,
 						  int (*callback)(const uint8_t *net_addr, int net_addr_len, const uint8_t mac[6], void *arg),
 						  void *arg);
+
+/* parse an RTM_NEWNEIGH netlink message, returns 0 when it carries a usable
+ * unicast ip -> mac mapping with a verified, non-zero 6-byte lladdr */
+struct nlmsghdr;
+int netlink_parse_neighbor(const struct nlmsghdr *nlh, const uint8_t **out_net_addr, int *out_net_addr_len,
+						   const uint8_t **out_mac);
 
 void SSL_CRYPTO_thread_setup(void);
 
@@ -136,7 +141,8 @@ int SSL_base64_decode_ext(const char *in, unsigned char *out, int max_outlen, in
 
 int SSL_base64_encode(const void *in, int in_len, char *out);
 
-int generate_cert_key(const char *key_path, const char *cert_path, const char *root_key_path, const char *san, int days);
+int generate_cert_key(const char *key_path, const char *cert_path, const char *root_key_path, const char *san,
+					  int days);
 
 int generate_cert_san(char *san, int max_san_len, const char *append_san);
 
@@ -207,6 +213,13 @@ int dns_packet_debug(const char *packet_file);
 int dns_is_quic_supported(void);
 
 int decode_hex(int ch);
+
+static inline void *zalloc(size_t count, size_t size)
+{
+	return calloc(count, size);
+}
+
+int encode_alpn_protos(const char *alpn, uint8_t *alpn_data, int alpn_data_max);
 
 #ifdef __cplusplus
 }

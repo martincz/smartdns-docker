@@ -39,13 +39,7 @@ fn test_rest_api_login() {
     assert!(result.is_ok());
     let token = result.unwrap();
     assert!(!token.token.is_empty());
-    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
-    validation.insecure_disable_signature_validation();
-    let calims = jsonwebtoken::decode::<JwtClaims>(
-        &token.token,
-        &jsonwebtoken::DecodingKey::from_secret(&[]),
-        &validation,
-    );
+    let calims = jsonwebtoken::dangerous::insecure_decode::<JwtClaims>(&token.token);
     println!("calims: {:?}", calims);
     assert_eq!(token.expires_in, "600");
     assert!(calims.is_ok());
@@ -479,6 +473,7 @@ fn test_rest_api_get_client() {
         let mut request = TestDnsRequest::new();
         request.domain = format!("{}.com", i);
         request.remote_addr = format!("client-{}", i);
+        request.remote_mac = [1, 2, 3, 4, 5, i as u8];
         request.id = i as u16;
         assert!(server.send_test_dnsrequest(request).is_ok());
     }
@@ -691,4 +686,32 @@ fn test_rest_api_server_status() {
     assert!(server_list.len() > 0);
     let exists = server_list.iter().any(|server| server.ip == "1.2.3.4");
     assert!(exists);
+}
+
+#[test]
+fn test_rest_api_cache_domains() {
+    let mut server = common::TestServer::new();
+    server.set_log_level(LogLevel::DEBUG);
+    assert!(server.start().is_ok());
+
+    let mut client = common::TestClient::new(&server.get_host());
+    let res = client.login("admin", "password");
+    assert!(res.is_ok());
+
+    let c = client.get("/api/cache/domains");
+    assert!(c.is_ok());
+    let (code, body) = c.unwrap();
+    assert_eq!(code, 200, "Expected 200 OK, got {}", code);
+
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(json.get("domains").is_some(), "Response missing 'domains' field");
+    let domains = json["domains"].as_array().unwrap();
+
+    for domain in domains {
+        assert!(domain.get("id").is_some());
+        assert!(domain.get("domain").is_some());
+        assert!(domain.get("qtype").is_some());
+        assert!(domain.get("cached_time").is_some());
+        assert!(domain.get("ttl_remaining").is_some());
+    }
 }

@@ -22,6 +22,7 @@ SMARTDNS_TEST_LIB=$(SMARTDNS_SRC_DIR)/libsmartdns-test.a
 CXXFLAGS += -g
 CXXFLAGS += -DTEST
 CXXFLAGS += -I./ -I../src -I../src/include
+CXXFLAGS += -fno-omit-frame-pointer -Wstrict-aliasing -funwind-tables
 
 TEST_SOURCES := $(wildcard *.cc) $(wildcard */*.cc) $(wildcard */*/*.cc)
 TEST_OBJECTS := $(patsubst %.cc, %.o, $(TEST_SOURCES))
@@ -29,8 +30,29 @@ OBJS += $(TEST_OBJECTS)
 
 SMARTDNS_SRC_FILES := $(wildcard $(SMARTDNS_SRC_DIR)/*.c) $(wildcard $(SMARTDNS_SRC_DIR)/*.h) $(wildcard $(SMARTDNS_SRC_DIR)/lib/*.c)
 
+ifeq ($(filter -j,$(MAKEFLAGS)),)
+MAKEFLAGS += -j$(shell nproc)
+endif
 
-LDFLAGS += -lssl -lcrypto -lpthread -ldl -lgtest -lstdc++ -lm
+HASH := \#
+WITH_ZLIB ?= auto
+HAS_ZLIB := $(shell printf '$(HASH)include <zlib.h>\nint main(void) { return zlibVersion()[0] == 0; }' | $(CC) -x c - -lz -o /dev/null >/dev/null 2>&1 && echo -n 1 || echo -n 0)
+ifeq ($(WITH_ZLIB), yes)
+override WITH_ZLIB := 1
+endif
+ifeq ($(WITH_ZLIB), auto)
+ ifeq ($(HAS_ZLIB), 1)
+  ZLIB_CXXFLAGS += -DWITH_ZLIB
+  ZLIB_LDFLAGS += -lz
+ endif
+else ifeq ($(WITH_ZLIB), 1)
+ZLIB_CXXFLAGS += -DWITH_ZLIB
+ZLIB_LDFLAGS += -lz
+endif
+
+CXXFLAGS += $(ZLIB_CXXFLAGS)
+LDFLAGS += -lssl -lcrypto -lpthread -ldl -lgtest -lstdc++ -lm -rdynamic
+LDFLAGS += $(ZLIB_LDFLAGS)
 LDFLAGS += $(EXTRA_LDFLAGS)
 
 .PHONY: all clean test $(SMARTDNS_TEST_LIB)
@@ -44,7 +66,7 @@ test: $(BIN)
 	./$(BIN)
 
 $(SMARTDNS_TEST_LIB): 
-	$(MAKE) -C $(SMARTDNS_SRC_DIR) libsmartdns-test.a
+	$(MAKE) DEBUG=1 WITH_ZLIB=$(WITH_ZLIB) -C $(SMARTDNS_SRC_DIR) libsmartdns-test.a
 
 clean:
 	$(RM) $(OBJS) $(BIN)

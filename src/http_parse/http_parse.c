@@ -17,8 +17,8 @@
  */
 
 #include "smartdns/http_parse.h"
+#include "smartdns/util.h"
 #include "http1_parse.h"
-#include "http2_parse.h"
 #include "http3_parse.h"
 #include "http_parse.h"
 #include <stdio.h>
@@ -37,17 +37,16 @@ struct http_head *http_head_init(int buffsize, HTTP_VERSION version)
 	struct http_head *http_head = NULL;
 	unsigned char *buffer = NULL;
 
-	http_head = malloc(sizeof(*http_head));
+	http_head = zalloc(1, sizeof(*http_head));
 	if (http_head == NULL) {
 		goto errout;
 	}
-	memset(http_head, 0, sizeof(*http_head));
 	INIT_LIST_HEAD(&http_head->field_head.list);
 	hash_init(http_head->field_map);
 	INIT_LIST_HEAD(&http_head->params.list);
 	hash_init(http_head->params_map);
 
-	buffer = malloc(buffsize);
+	buffer = zalloc(1, buffsize);
 	if (buffer == NULL) {
 		goto errout;
 	}
@@ -233,11 +232,10 @@ int _http_head_add_param(struct http_head *http_head, const char *name, const ch
 {
 	uint32_t key = 0;
 	struct http_params *params = NULL;
-	params = malloc(sizeof(*params));
+	params = zalloc(1, sizeof(*params));
 	if (params == NULL) {
 		return -1;
 	}
-	memset(params, 0, sizeof(*params));
 
 	params->name = name;
 	params->value = value;
@@ -330,11 +328,10 @@ static int _http_head_add_fields(struct http_head *http_head, const char *name, 
 {
 	uint32_t key = 0;
 	struct http_head_fields *fields = NULL;
-	fields = malloc(sizeof(*fields));
+	fields = zalloc(1, sizeof(*fields));
 	if (fields == NULL) {
 		return -1;
 	}
-	memset(fields, 0, sizeof(*fields));
 
 	fields->name = name;
 	fields->value = value;
@@ -454,8 +451,6 @@ int http_head_parse(struct http_head *http_head, const unsigned char *data, int 
 {
 	if (http_head->http_version == HTTP_VERSION_1_1) {
 		return http_head_parse_http1_1(http_head, data, data_len);
-	} else if (http_head->http_version == HTTP_VERSION_2_0) {
-		return http_head_parse_http2_0(http_head, data, data_len);
 	} else if (http_head->http_version == HTTP_VERSION_3_0) {
 		return http_head_parse_http3_0(http_head, data, data_len);
 	}
@@ -471,8 +466,6 @@ int http_head_serialize(struct http_head *http_head, void *buffer, int buffer_le
 
 	if (http_head->http_version == HTTP_VERSION_1_1) {
 		return http_head_serialize_http1_1(http_head, buffer, buffer_len);
-	} else if (http_head->http_version == HTTP_VERSION_2_0) {
-		return http_head_serialize_http2_0(http_head, buffer, buffer_len);
 	} else if (http_head->http_version == HTTP_VERSION_3_0) {
 		return http_head_serialize_http3_0(http_head, buffer, buffer_len);
 	}

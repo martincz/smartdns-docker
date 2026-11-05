@@ -14,22 +14,34 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- */
+ *
+ *************************************************************************/
 
-#ifndef _HTTP_PARSE_HTTP2_H_
-#define _HTTP_PARSE_HTTP2_H_
+#ifndef _SERVER_HTTP2_H_
+#define _SERVER_HTTP2_H_
 
-#include "http_parse.h"
+#include "dns_server.h"
+#include "smartdns/http2.h"
+#include <sys/epoll.h>
 
 #ifdef __cplusplus
 extern "C" {
-#endif /*__cplusplus */
+#endif
 
-int http_head_parse_http2_0(struct http_head *http_head, const uint8_t *data, int data_len);
+struct dns_server_conn_http2_stream {
+	struct dns_server_conn_head head;
+	struct http2_stream *stream;
+	struct dns_server_conn_tls_client *tls_client;
+};
 
-int http_head_serialize_http2_0(struct http_head *http_head, uint8_t *buffer, int buffer_len);
+int _dns_server_process_http2(struct dns_server_conn_tls_client *tls_client, struct epoll_event *event,
+							  unsigned long now);
+
+int _dns_server_reply_http2(struct dns_request *request, struct dns_server_conn_http2_stream *stream_conn,
+							unsigned char *inpacket, int inpacket_len);
 
 #ifdef __cplusplus
 }
-#endif /*__cplusplus */
+#endif
+
 #endif

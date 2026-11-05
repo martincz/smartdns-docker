@@ -19,9 +19,11 @@
 #define _GNU_SOURCE
 
 #include "client_tls.h"
+#include "client_http2.h"
 #include "client_quic.h"
 #include "client_socket.h"
 #include "client_tcp.h"
+#include "conn_stream.h"
 #include "server_info.h"
 
 #include "smartdns/lib/stringutil.h"
@@ -169,6 +171,16 @@ static SSL_SESSION *_ssl_get1_session(struct dns_server_info *server)
 	return ret;
 }
 
+static void _dns_client_tls_clear_session(struct dns_server_info *server_info)
+{
+	pthread_mutex_lock(&server_info->lock);
+	if (server_info->ssl_session) {
+		SSL_SESSION_free(server_info->ssl_session);
+		server_info->ssl_session = NULL;
+	}
+	pthread_mutex_unlock(&server_info->lock);
+}
+
 int dns_client_spki_decode(const char *spki, unsigned char *spki_data_out, int spki_data_out_max_len)
 {
 	int spki_data_len = -1;
@@ -293,9 +305,15 @@ static int _dns_client_set_trusted_cert(SSL_CTX *ssl_ctx)
 	return 0;
 }
 
+static int _dns_client_has_explicit_ca_config(void)
+{
+	return dns_conf.ca_file[0] || dns_conf.ca_path[0];
+}
+
 SSL_CTX *_ssl_ctx_get(int is_quic)
 {
 	SSL_CTX **ssl_ctx = NULL;
+	int explicit_ca_config = _dns_client_has_explicit_ca_config();
 	pthread_mutex_lock(&client.server_list_lock);
 	if (is_quic) {
 		ssl_ctx = &client.ssl_quic_ctx;
@@ -334,6 +352,12 @@ SSL_CTX *_ssl_ctx_get(int is_quic)
 	SSL_CTX_set_session_cache_mode(*ssl_ctx, SSL_SESS_CACHE_CLIENT);
 	SSL_CTX_sess_set_cache_size(*ssl_ctx, DNS_MAX_SERVERS);
 	if (_dns_client_set_trusted_cert(*ssl_ctx) != 0) {
+		if (explicit_ca_config) {
+			tlog(TLOG_ERROR, "load configured CA certificate failed.");
+			goto errout;
+		}
+
+		tlog(TLOG_WARN, "load system CA certificate failed, disable upstream certificate verification.");
 		SSL_CTX_set_verify(*ssl_ctx, SSL_VERIFY_NONE, NULL);
 		client.ssl_verify_skip = 1;
 	}
@@ -379,6 +403,11 @@ int _dns_client_create_socket_tls(struct dns_server_info *server_info, const cha
 		fd = socket(server_info->ai_family, SOCK_STREAM, 0);
 	}
 
+	if (fd < 0) {
+		tlog(TLOG_ERROR, "create socket failed, %s", strerror(errno));
+		goto errout;
+	}
+
 	if (server_info->flags.ifname[0] != '\0') {
 		struct ifreq ifr;
 		memset(&ifr, 0, sizeof(struct ifreq));
@@ -393,11 +422,6 @@ int _dns_client_create_socket_tls(struct dns_server_info *server_info, const cha
 	ssl = SSL_new(server_info->ssl_ctx);
 	if (ssl == NULL) {
 		tlog(TLOG_ERROR, "new ssl failed, %s", server_info->ip);
-		goto errout;
-	}
-
-	if (fd < 0) {
-		tlog(TLOG_ERROR, "create socket failed, %s", strerror(errno));
 		goto errout;
 	}
 
@@ -460,13 +484,13 @@ int _dns_client_create_socket_tls(struct dns_server_info *server_info, const cha
 
 	if (alpn && alpn[0] != 0) {
 		uint8_t alpn_data[DNS_MAX_ALPN_LEN];
-		int32_t alpn_len = strnlen(alpn, DNS_MAX_ALPN_LEN - 1);
-		alpn_data[0] = alpn_len;
-		memcpy(alpn_data + 1, alpn, alpn_len);
-		alpn_len++;
-		if (SSL_set_alpn_protos(ssl, alpn_data, alpn_len)) {
-			tlog(TLOG_INFO, "SSL_set_alpn_protos failed.");
-			goto errout;
+		int alpn_data_len = encode_alpn_protos(alpn, alpn_data, sizeof(alpn_data));
+
+		if (alpn_data_len > 0) {
+			if (SSL_set_alpn_protos(ssl, alpn_data, alpn_data_len)) {
+				tlog(TLOG_INFO, "SSL_set_alpn_protos failed.");
+				goto errout;
+			}
 		}
 	}
 
@@ -485,7 +509,7 @@ int _dns_client_create_socket_tls(struct dns_server_info *server_info, const cha
 	event.events = EPOLLIN | EPOLLOUT;
 	event.data.ptr = server_info;
 	if (epoll_ctl(client.epoll_fd, EPOLL_CTL_ADD, fd, &event) != 0) {
-		tlog(TLOG_ERROR, "epoll ctl failed.");
+		tlog(TLOG_ERROR, "epoll ctl failed, %s", strerror(errno));
 		goto errout;
 	}
 
@@ -502,6 +526,8 @@ errout:
 	}
 
 	server_info->status = DNS_SERVER_STATUS_INIT;
+	server_info->proxy = NULL;
+	server_info->ssl_write_len = -1;
 
 	if (fd > 0 && proxy == NULL) {
 		close(fd);
@@ -564,7 +590,7 @@ int _dns_client_socket_ssl_send_ext(struct dns_server_info *server, SSL *ssl, co
 			return -1;
 		}
 
-		tlog(TLOG_ERROR, "server %s SSL write fail error: %s", server->ip, ERR_error_string(ssl_err, buff));
+		tlog(TLOG_WARN, "server %s SSL write fail error: %s", server->ip, ERR_error_string(ssl_err, buff));
 		errno = EFAULT;
 		ret = -1;
 	} break;
@@ -629,9 +655,11 @@ int _dns_client_socket_ssl_recv_ext(struct dns_server_info *server, SSL *ssl, vo
 		case SSL_R_UNEXPECTED_EOF_WHILE_READING:
 #endif
 			return 0;
+		default:
+			break;
 		}
 
-		tlog(TLOG_ERROR, "server %s SSL read fail error: %s", server->ip, ERR_error_string(ssl_err, buff));
+		tlog(TLOG_WARN, "server %s SSL read fail error: %s", server->ip, ERR_error_string(ssl_err, buff));
 		errno = EFAULT;
 		ret = -1;
 	} break;
@@ -731,7 +759,12 @@ static int _dns_client_tls_matchName(const char *host, const char *pattern, int 
 
 static int _dns_client_tls_get_cert_CN(X509 *cert, char *cn, int max_cn_len)
 {
-	X509_NAME *cert_name = NULL;
+	const X509_NAME *cert_name = NULL;
+	const X509_NAME_ENTRY *cert_entry = NULL;
+	const ASN1_STRING *cert_data = NULL;
+	const unsigned char *cert_text = NULL;
+	int cert_index = 0;
+	int cert_text_len = 0;
 
 	cert_name = X509_get_subject_name(cert);
 	if (cert_name == NULL) {
@@ -739,10 +772,41 @@ static int _dns_client_tls_get_cert_CN(X509 *cert, char *cn, int max_cn_len)
 		goto errout;
 	}
 
-	if (X509_NAME_get_text_by_NID(cert_name, NID_commonName, cn, max_cn_len) == -1) {
+	cert_index = X509_NAME_get_index_by_NID(cert_name, NID_commonName, -1);
+	if (cert_index < 0) {
 		tlog(TLOG_ERROR, "cannot found x509 name");
 		goto errout;
 	}
+
+	cert_entry = X509_NAME_get_entry(cert_name, cert_index);
+	if (cert_entry == NULL) {
+		tlog(TLOG_ERROR, "get x509 name entry failed.");
+		goto errout;
+	}
+
+	cert_data = X509_NAME_ENTRY_get_data(cert_entry);
+	if (cert_data == NULL) {
+		tlog(TLOG_ERROR, "get x509 name data failed.");
+		goto errout;
+	}
+
+	cert_text_len = ASN1_STRING_length(cert_data);
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+	cert_text = ASN1_STRING_data((ASN1_STRING *)cert_data);
+#else
+	cert_text = ASN1_STRING_get0_data(cert_data);
+#endif
+	if (cert_text == NULL || cert_text_len <= 0 || max_cn_len <= 0) {
+		tlog(TLOG_ERROR, "get x509 name text failed.");
+		goto errout;
+	}
+
+	if (cert_text_len >= max_cn_len) {
+		cert_text_len = max_cn_len - 1;
+	}
+
+	memcpy(cn, cert_text, cert_text_len);
+	cn[cert_text_len] = '\0';
 
 	return 0;
 
@@ -789,13 +853,25 @@ static int _dns_client_verify_SAN(struct dns_server_info *server_info, X509 *cer
 		switch (name->type) {
 		case GEN_DNS: {
 			ASN1_IA5STRING *dns = name->d.dNSName;
+			const unsigned char *dns_data = NULL;
+			int dns_len = 0;
 			if (dns == NULL) {
 				continue;
 			}
 
-			tlog(TLOG_DEBUG, "peer SAN: %s", dns->data);
-			if (_dns_client_tls_matchName(tls_host_verify, (char *)dns->data, dns->length) == 0) {
-				tlog(TLOG_DEBUG, "peer SAN match: %s", dns->data);
+			dns_len = ASN1_STRING_length(dns);
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+			dns_data = ASN1_STRING_data(dns);
+#else
+			dns_data = ASN1_STRING_get0_data(dns);
+#endif
+			if (dns_data == NULL || dns_len <= 0) {
+				continue;
+			}
+
+			tlog(TLOG_DEBUG, "peer SAN: %.*s", dns_len, dns_data);
+			if (_dns_client_tls_matchName(tls_host_verify, (const char *)dns_data, dns_len) == 0) {
+				tlog(TLOG_DEBUG, "peer SAN match: %.*s", dns_len, dns_data);
 				GENERAL_NAMES_free(alt_names);
 				return 0;
 			}
@@ -858,7 +934,7 @@ errout:
 static int _dns_client_tls_verify(struct dns_server_info *server_info)
 {
 	X509 *cert = NULL;
-	X509_PUBKEY *pubkey = NULL;
+	const X509_PUBKEY *pubkey = NULL;
 
 	char cert_fingerprint[256];
 	int i = 0;
@@ -1011,6 +1087,7 @@ int _dns_client_process_tls(struct dns_server_info *server_info, struct epoll_ev
 				return 0;
 			}
 
+			_dns_client_tls_clear_session(server_info);
 			if (ssl_ret != SSL_ERROR_SYSCALL) {
 				unsigned long ssl_err = ERR_get_error();
 				int ssl_reason = ERR_GET_REASON(ssl_err);
@@ -1049,6 +1126,18 @@ int _dns_client_process_tls(struct dns_server_info *server_info, struct epoll_ev
 			pthread_mutex_unlock(&server_info->lock);
 		}
 
+		/* Detect negotiated ALPN protocol */
+		const unsigned char *alpn_data = NULL;
+		unsigned int alpn_len = 0;
+		SSL_get0_alpn_selected(server_info->ssl, &alpn_data, &alpn_len);
+		if (alpn_data && alpn_len > 0 && alpn_len < sizeof(server_info->alpn_selected)) {
+			memcpy(server_info->alpn_selected, alpn_data, alpn_len);
+			server_info->alpn_selected[alpn_len] = '\0';
+			tlog(TLOG_DEBUG, "ALPN negotiated: %s", server_info->alpn_selected);
+		} else {
+			safe_strncpy(server_info->alpn_selected, "http/1.1", sizeof(server_info->alpn_selected));
+		}
+
 		server_info->status = DNS_SERVER_STATUS_CONNECTED;
 		memset(&fd_event, 0, sizeof(fd_event));
 		fd_event.events = EPOLLIN | EPOLLOUT;
@@ -1073,13 +1162,22 @@ int _dns_client_process_tls(struct dns_server_info *server_info, struct epoll_ev
 #endif
 	}
 
+	/* Check if HTTPS server negotiated HTTP/2 */
+	if (server_info->type == DNS_SERVER_HTTPS && strncmp(server_info->alpn_selected, "h2", sizeof("h2")) == 0) {
+		/* HTTP/2 processing */
+		if (_dns_client_process_http2(server_info, event, now) != 0) {
+			goto errout;
+		}
+		return 0;
+	}
+
 	return _dns_client_process_tcp(server_info, event, now);
 errout:
 	pthread_mutex_lock(&server_info->lock);
 	server_info->recv_buff.len = 0;
 	server_info->send_buff.len = 0;
-	_dns_client_close_socket(server_info);
 	pthread_mutex_unlock(&server_info->lock);
+	_dns_client_close_socket(server_info);
 
 	return -1;
 }

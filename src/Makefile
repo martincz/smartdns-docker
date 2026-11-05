@@ -1,4 +1,3 @@
-
 # Copyright (C) 2018-2025 Ruilin Peng (Nick) <pymumu@gmail.com>.
 #
 # smartdns is free software: you can redistribute it and/or modify
@@ -24,6 +23,10 @@ LINT_OBJS=$(filter-out lib/%.o, $(OBJS))
 TEST_OBJS=$(patsubst %.o,%_test.o,$(OBJS))
 MAIN_OBJ = main.o
 
+ifeq ($(filter -j,$(MAKEFLAGS)),)
+MAKEFLAGS += -j$(shell nproc)
+endif
+
 # cflags
 ifndef CFLAGS
  ifdef DEBUG
@@ -38,6 +41,21 @@ HASH := \#
 HAS_UNWIND := $(shell printf '$(HASH)include <unwind.h>\nvoid main() { _Unwind_Backtrace(0, 0);}' | $(CC) -x c - -o /dev/null >/dev/null 2>&1 && echo -n 1 || echo -n 0)
 ifeq ($(HAS_UNWIND), 1)
 override CFLAGS += -DHAVE_UNWIND_BACKTRACE
+endif
+
+WITH_ZLIB ?= auto
+HAS_ZLIB := $(shell printf '$(HASH)include <zlib.h>\nint main(void) { return zlibVersion()[0] == 0; }' | $(CC) -x c - -lz -o /dev/null >/dev/null 2>&1 && echo -n 1 || echo -n 0)
+ifeq ($(WITH_ZLIB), yes)
+override WITH_ZLIB := 1
+endif
+ifeq ($(WITH_ZLIB), auto)
+ ifeq ($(HAS_ZLIB), 1)
+  override CFLAGS += -DWITH_ZLIB
+  override LDFLAGS += -lz
+ endif
+else ifeq ($(WITH_ZLIB), 1)
+override CFLAGS += -DWITH_ZLIB
+override LDFLAGS += -lz
 endif
 
 override CFLAGS +=-Iinclude
@@ -100,8 +118,18 @@ $(SMARTDNS_TEST_LIB): $(TEST_OBJS)
 $(SMARTDNS_LIB): $(OBJS)
 	$(AR) rcs $@ $^
 
+clang-tidy-parallel:
+	@echo "Running clang-tidy with $(shell nproc) parallel jobs..."
+	@printf '%s\n' $(LINT_OBJS:.o=.c) | xargs -P $(shell nproc) -I {} clang-tidy {} -- $(CFLAGS)
+
 clang-tidy:
 	clang-tidy -p=. $(LINT_OBJS:.o=.c) -- $(CFLAGS)
 
 clean:
 	$(RM) $(OBJS) $(BIN) $(SMARTDNS_LIB) $(MAIN_OBJ) $(SMARTDNS_TEST_LIB) $(TEST_OBJS)
+
+# lint specific files
+# make lint-files FILES="dns.c proxy.c"
+lint-files:
+	@echo "Specify FILES variable to lint specific files, e.g., make lint-files FILES='src/dns.c src/proxy.c'"
+	clang-tidy -p=. $(FILES) -- $(CFLAGS)

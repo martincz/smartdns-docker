@@ -20,6 +20,7 @@
 
 #include "smartdns/util.h"
 
+#include "client_http2.h"
 #include "client_http3.h"
 #include "client_https.h"
 #include "client_mdns.h"
@@ -28,6 +29,7 @@
 #include "client_tcp.h"
 #include "client_tls.h"
 #include "client_udp.h"
+#include "conn_stream.h"
 #include "dns_client.h"
 #include "ecs.h"
 #include "group.h"
@@ -145,7 +147,7 @@ int _dns_client_recv(struct dns_server_info *server_info, unsigned char *inpacke
 	}
 
 	/* avoid multiple replies */
-	if (_dns_replied_check_add(query, from, from_len) != 0) {
+	if (_dns_replied_check_add(query, server_info) != 0) {
 		_dns_client_query_release(query);
 		return 0;
 	}
@@ -164,7 +166,7 @@ int _dns_client_recv(struct dns_server_info *server_info, unsigned char *inpacke
 
 		if (ret == DNS_CLIENT_ACTION_RETRY || ret == DNS_CLIENT_ACTION_DROP) {
 			/* remove this result */
-			_dns_replied_check_remove(query, from, from_len);
+			_dns_replied_check_remove(query, server_info);
 			atomic_inc(&query->dns_request_sent);
 			if (ret == DNS_CLIENT_ACTION_RETRY) {
 				/*
@@ -221,13 +223,154 @@ static int _dns_client_process(struct dns_server_info *server_info, struct epoll
 	return 0;
 }
 
+static int _dns_client_send_http(struct dns_server_info *server_info, struct dns_query_struct *query, void *packet_data,
+								 int packet_data_len)
+{
+	/* If ALPN is negotiated and is NOT h2, use HTTP/1.1 */
+	if (server_info->alpn_selected[0] != '\0' && strncmp(server_info->alpn_selected, "h2", 2) != 0) {
+		return _dns_client_send_http1(server_info, packet_data, packet_data_len);
+	}
+
+	/* Default to HTTP/2 buffering (stream-based).
+	   If ALPN later turns out to be H1, _dns_client_process_https_streams will handle it. */
+	return _dns_client_send_http2(server_info, query, packet_data, packet_data_len);
+}
+
+static int _dns_client_check_server_prohibit(struct dns_server_info *server_info, int prohibit_time)
+{
+	if (server_info->prohibit) {
+		if (server_info->is_already_prohibit == 0) {
+			server_info->is_already_prohibit = 1;
+			_dns_server_inc_prohibit_server_num(server_info);
+			time(&server_info->last_send);
+			time(&server_info->last_recv);
+			if (server_info->type != DNS_SERVER_MDNS) {
+				tlog(TLOG_INFO, "server %s not alive, prohibit", server_info->ip);
+			}
+			_dns_client_shutdown_socket(server_info);
+		}
+
+		time_t now = 0;
+		time(&now);
+		if ((now - prohibit_time < server_info->last_send)) {
+			return 1;
+		}
+		server_info->prohibit = 0;
+		server_info->is_already_prohibit = 0;
+		_dns_server_dec_prohibit_server_num(server_info);
+		if (now - prohibit_time >= server_info->last_send) {
+			_dns_client_close_socket(server_info);
+		}
+	}
+	return 0;
+}
+
+static int _dns_client_send_one_packet(struct dns_server_info *server_info, struct dns_query_struct *query,
+									   void *packet_data, int packet_data_len)
+{
+	int ret = 0;
+	int send_err = 0;
+	int retry = 0;
+
+	atomic_inc(&query->dns_request_sent);
+	stats_inc(&server_info->stats.total);
+	errno = 0;
+	server_info->send_tick = get_tick_count();
+
+	while (1) {
+		switch (server_info->type) {
+		case DNS_SERVER_UDP:
+			/* udp query */
+			ret = _dns_client_send_udp(server_info, packet_data, packet_data_len);
+			send_err = errno;
+			break;
+		case DNS_SERVER_TCP:
+			/* tcp query */
+			ret = _dns_client_send_tcp(server_info, packet_data, packet_data_len);
+			send_err = errno;
+			break;
+		case DNS_SERVER_TLS:
+			/* tls query */
+			ret = _dns_client_send_tls(server_info, packet_data, packet_data_len);
+			send_err = errno;
+			break;
+		case DNS_SERVER_HTTPS:
+			/* https query - buffer raw data in stream, protocol determined later */
+			ret = _dns_client_send_http(server_info, query, packet_data, packet_data_len);
+			send_err = errno;
+			break;
+		case DNS_SERVER_MDNS:
+			/* mdns query */
+			ret = _dns_client_send_udp_mdns(server_info, packet_data, packet_data_len);
+			send_err = errno;
+			break;
+		case DNS_SERVER_QUIC:
+			/* quic query */
+			ret = _dns_client_send_quic(query, server_info, packet_data, packet_data_len);
+			send_err = errno;
+			break;
+		case DNS_SERVER_HTTP3:
+			/* http3 query */
+			ret = _dns_client_send_http3(query, server_info, packet_data, packet_data_len);
+			send_err = errno;
+			break;
+		default:
+			/* unsupported query type */
+			ret = -1;
+			break;
+		}
+
+		if (ret != 0) {
+			switch (send_err) {
+			case EBADF:
+			case ECONNRESET:
+			case EPIPE:
+			case EDESTADDRREQ:
+			case EINVAL:
+			case EISCONN:
+			case ENOTCONN:
+			case ENOTSOCK:
+			case EOPNOTSUPP: {
+				tlog(TLOG_DEBUG, "send query to %s failed, %s, type: %d", server_info->ip, strerror(send_err),
+					 server_info->type);
+				_dns_client_close_socket(server_info);
+				if (retry == 0) {
+					retry = 1;
+					if (_dns_client_create_socket(server_info) == 0) {
+						continue;
+					}
+				}
+				atomic_dec(&query->dns_request_sent);
+				return -1;
+			}
+			default:
+				break;
+			}
+
+			tlog(TLOG_DEBUG, "send query to %s failed, %s, type: %d", server_info->ip, strerror(send_err),
+				 server_info->type);
+			time_t now = 0;
+			time(&now);
+			if (now - 10 > server_info->last_recv || send_err != ENOMEM) {
+				server_info->prohibit = 1;
+			}
+
+			atomic_dec(&query->dns_request_sent);
+			return -1;
+		}
+		break;
+	}
+	time(&server_info->last_send);
+
+	return 0;
+}
+
 int _dns_client_send_packet(struct dns_query_struct *query, void *packet, int len)
 {
 	struct dns_server_info *server_info = NULL;
 	struct dns_server_group_member *group_member = NULL;
 	struct dns_server_group_member *tmp = NULL;
 	int ret = 0;
-	int send_err = 0;
 	int i = 0;
 	int total_server = 0;
 	int send_count = 0;
@@ -264,30 +407,10 @@ int _dns_client_send_packet(struct dns_query_struct *query, void *packet, int le
 				continue;
 			}
 
-			if (server_info->prohibit) {
-				if (server_info->is_already_prohibit == 0) {
-					server_info->is_already_prohibit = 1;
-					_dns_server_inc_prohibit_server_num(server_info);
-					time(&server_info->last_send);
-					time(&server_info->last_recv);
-					if (server_info->type != DNS_SERVER_MDNS) {
-						tlog(TLOG_INFO, "server %s not alive, prohibit", server_info->ip);
-					}
-					_dns_client_shutdown_socket(server_info);
-				}
-
-				time_t now = 0;
-				time(&now);
-				if ((now - prohibit_time < server_info->last_send)) {
-					continue;
-				}
-				server_info->prohibit = 0;
-				server_info->is_already_prohibit = 0;
-				_dns_server_dec_prohibit_server_num(server_info);
-				if (now - prohibit_time >= server_info->last_send) {
-					_dns_client_close_socket(server_info);
-				}
+			if (_dns_client_check_server_prohibit(server_info, prohibit_time)) {
+				continue;
 			}
+
 			total_server++;
 			tlog(TLOG_DEBUG, "send query to server %s:%d, type:%d", server_info->ip, server_info->port,
 				 server_info->type);
@@ -304,88 +427,9 @@ int _dns_client_send_packet(struct dns_query_struct *query, void *packet, int le
 				continue;
 			}
 
-			atomic_inc(&query->dns_request_sent);
-			stats_inc(&server_info->stats.total);
-			send_count++;
-			errno = 0;
-			server_info->send_tick = get_tick_count();
-
-			switch (server_info->type) {
-			case DNS_SERVER_UDP:
-				/* udp query */
-				ret = _dns_client_send_udp(server_info, packet_data, packet_data_len);
-				send_err = errno;
-				break;
-			case DNS_SERVER_TCP:
-				/* tcp query */
-				ret = _dns_client_send_tcp(server_info, packet_data, packet_data_len);
-				send_err = errno;
-				break;
-			case DNS_SERVER_TLS:
-				/* tls query */
-				ret = _dns_client_send_tls(server_info, packet_data, packet_data_len);
-				send_err = errno;
-				break;
-			case DNS_SERVER_HTTPS:
-				/* https query */
-				ret = _dns_client_send_https(server_info, packet_data, packet_data_len);
-				send_err = errno;
-				break;
-			case DNS_SERVER_MDNS:
-				/* mdns query */
-				ret = _dns_client_send_udp_mdns(server_info, packet_data, packet_data_len);
-				send_err = errno;
-				break;
-			case DNS_SERVER_QUIC:
-				/* quic query */
-				ret = _dns_client_send_quic(query, server_info, packet_data, packet_data_len);
-				send_err = errno;
-				break;
-			case DNS_SERVER_HTTP3:
-				/* http3 query */
-				ret = _dns_client_send_http3(query, server_info, packet_data, packet_data_len);
-				send_err = errno;
-				break;
-			default:
-				/* unsupported query type */
-				ret = -1;
-				break;
+			if (_dns_client_send_one_packet(server_info, query, packet_data, packet_data_len) == 0) {
+				send_count++;
 			}
-
-			if (ret != 0) {
-				switch (send_err) {
-				case EBADF:
-				case ECONNRESET:
-				case EDESTADDRREQ:
-				case EINVAL:
-				case EISCONN:
-				case ENOTCONN:
-				case ENOTSOCK:
-				case EOPNOTSUPP: {
-					tlog(TLOG_DEBUG, "send query to %s failed, %s, type: %d", server_info->ip, strerror(send_err),
-						 server_info->type);
-					_dns_client_close_socket(server_info);
-					atomic_dec(&query->dns_request_sent);
-					send_count--;
-					continue;
-				}
-				default:
-					break;
-				}
-
-				tlog(TLOG_DEBUG, "send query to %s failed, %s, type: %d", server_info->ip, strerror(send_err),
-					 server_info->type);
-				time_t now = 0;
-				time(&now);
-				if (now - 10 > server_info->last_recv || send_err != ENOMEM) {
-					server_info->prohibit = 1;
-				}
-
-				atomic_dec(&query->dns_request_sent);
-				send_count--;
-				continue;
-			}
-			time(&server_info->last_send);
 		}
 		pthread_mutex_unlock(&client.server_list_lock);
 
@@ -429,15 +473,15 @@ int dns_client_query(const char *domain, int qtype, dns_client_callback callback
 		goto errout;
 	}
 
-	query = malloc(sizeof(*query));
+	query = zalloc(1, sizeof(*query));
 	if (query == NULL) {
 		goto errout;
 	}
-	memset(query, 0, sizeof(*query));
 
 	INIT_HLIST_NODE(&query->domain_node);
 	INIT_LIST_HEAD(&query->dns_request_list);
 	INIT_LIST_HEAD(&query->conn_stream_list);
+	pthread_mutex_init(&query->lock, NULL);
 	atomic_set(&query->refcnt, 0);
 	atomic_set(&query->dns_request_sent, 0);
 	atomic_set(&query->retry_count, DNS_QUERY_RETRY);
@@ -556,56 +600,46 @@ static void *_dns_client_work(void *arg)
 	int num = 0;
 	int i = 0;
 	unsigned long now = {0};
-	unsigned long last = {0};
 	unsigned int msec = 0;
 	unsigned int sleep = 100;
 	int sleep_time = 0;
 	unsigned long expect_time = 0;
-	int unused __attribute__((unused));
+	unsigned long start_time = 0;
 
-	sleep_time = sleep;
-	now = get_tick_count() - sleep;
-	last = now;
+	now = get_tick_count();
+	start_time = now;
 	expect_time = now + sleep;
+
 	while (atomic_read(&client.run)) {
 		now = get_tick_count();
-		if (sleep_time > 0) {
-			sleep_time -= now - last;
-			if (sleep_time <= 0) {
-				sleep_time = 0;
-			}
-
-			int cnt = sleep_time / sleep;
-			msec -= cnt;
-			expect_time -= cnt * sleep;
-			sleep_time -= cnt * sleep;
-		}
 
 		if (now >= expect_time) {
-			msec++;
-			if (last != now) {
-				_dns_client_period_run(msec);
+			unsigned long elapsed_from_start = now - start_time;
+			unsigned int current_period = (elapsed_from_start + sleep / 2) / sleep;
+
+			if (current_period > msec) {
+				msec = current_period;
 			}
 
-			sleep_time = sleep - (now - expect_time);
-			if (sleep_time < 0) {
-				sleep_time = 0;
-				expect_time = now;
-			}
+			expect_time = start_time + (msec + 1) * sleep;
+			_dns_client_period_run(msec);
+			msec++;
 
 			/* When client is idle, the sleep time is 1000ms, to reduce CPU usage */
 			pthread_mutex_lock(&client.domain_map_lock);
 			if (list_empty(&client.dns_request_list)) {
-				int cnt = 10 - (msec % 10) - 1;
-				sleep_time += sleep * cnt;
-				msec += cnt;
-				/* sleep to next second */
-				expect_time += sleep * cnt;
+				if (msec % 10 != 0) {
+					msec = ((msec / 10) + 1) * 10;
+					expect_time = start_time + msec * sleep;
+				}
 			}
 			pthread_mutex_unlock(&client.domain_map_lock);
-			expect_time += sleep;
 		}
-		last = now;
+
+		sleep_time = (int)(expect_time - now);
+		if (sleep_time < 0) {
+			sleep_time = 0;
+		}
 
 		num = epoll_wait(client.epoll_fd, events, DNS_MAX_EVENTS, sleep_time);
 		if (num < 0) {
